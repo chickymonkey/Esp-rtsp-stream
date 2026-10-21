@@ -308,7 +308,7 @@ speaker:
     # ... pins and audio_dac as above ...
     sample_rate: 48000
   - platform: mixer
-    id: mixer_speaker
+    id: box_mixer                # not "mixer_speaker": that name clashes with ESPHome's C++ namespace
     output_speaker: box_speaker
     num_channels: 1
     source_speakers:
@@ -322,26 +322,166 @@ esp_rtsp_stream:
       sample_rate: 48000           # the mixer runs at the output speaker's rate
 ```
 
-### Mute from Home Assistant
+### Mute switch
+
+A template switch turns the camera audio on and off from Home Assistant. Make it `optimistic`, so its state and any icon on the screen change as soon as it is pressed. A switch that reads its state from a `lambda` is only polled every 60 s.
 
 ```yaml
+esp_rtsp_stream:
+  - id: front_door
+    audio:
+      speaker: camera_speaker
+      sample_rate: 48000
+      muted: true                  # start muted, matching the switch below
+
 switch:
   - platform: template
-    name: Camera audio
-    lambda: return !id(front_door).is_audio_muted();
+    id: camera_audio_switch
+    name: Camera RTSP audio
+    icon: "mdi:cctv"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
     turn_on_action:
       - lambda: id(front_door).set_audio_muted(false);
     turn_off_action:
       - lambda: id(front_door).set_audio_muted(true);
 ```
 
+### Voice assistant and micro wake word (shared I2S bus)
+
+On the ESP32-S3-BOX-3, the microphone and the speaker share one I2S bus, and ESPHome lets only one of them use it at a time. Micro wake word (mWW) keeps the microphone capturing all the time, so the camera audio can't start. The log then shows:
+
+```
+[E][i2s_audio.speaker.std:401]: Parent bus is busy
+[E][i2s_audio.speaker:134]: Driver failed to start; retrying in 1 second
+```
+
+There is no way round this on that wiring: the shared clock pins can't run the microphone at 16 kHz and the speaker at 48 kHz at once. The media player has the same limit, which is why the BOX-3 voice assistant config stops the wake word in `on_announcement`. Camera audio needs the same treatment. The switch frees the microphone before it unmutes and gives it back after it mutes, so the wake word is off while camera audio plays.
+
+The actions below use the `stop_wake_word` and `start_wake_word` scripts and the `wake_word_engine_location` select from the [ESPHome BOX-3 voice assistant config](https://github.com/esphome/wake-word-voice-assistants). Use the names from your own config if they differ.
+
+```yaml
+switch:
+  - platform: template
+    id: camera_audio_switch
+    name: Camera RTSP audio
+    icon: "mdi:cctv"
+    optimistic: true
+    restore_mode: ALWAYS_OFF          # matches muted: true in esp_rtsp_stream
+    turn_on_action:
+      # Free the I2S bus: stop the wake word, as on_announcement does
+      - if:
+          condition:
+            - microphone.is_capturing:
+          then:
+            - script.execute: stop_wake_word
+            - if:
+                condition:
+                  - lambda: return id(wake_word_engine_location).current_option() == "In Home Assistant";
+                then:
+                  - wait_until:
+                      - not:
+                          voice_assistant.is_running:
+            - wait_until:
+                condition:
+                  - not:
+                      microphone.is_capturing:
+                timeout: 2s
+      - lambda: id(front_door).set_audio_muted(false);
+    turn_off_action:
+      - lambda: id(front_door).set_audio_muted(true);
+      # Wait for the speaker to release the bus, then listen again
+      - wait_until:
+          condition:
+            - speaker.is_stopped: box_speaker
+          timeout: 3s
+      - script.execute: start_wake_word
+    on_turn_on:
+      - lvgl.label.update:
+          id: cam_audio_icon
+          text: "\U000F057E"   # mdi:volume-high
+          text_color: 0x00FF00
+    on_turn_off:
+      - lvgl.label.update:
+          id: cam_audio_icon
+          text: "\U000F0581"   # mdi:volume-off
+          text_color: white
+```
+
+Leave out `on_turn_on` and `on_turn_off` if you don't use the on-screen button below. Other things that restart the wake word, such as the media player's `on_idle` after an announcement, hit the same busy-bus error while camera audio is on. Turn camera audio off and on again if that happens.
+
+### LVGL page with a mute button
+
+This page shows the camera with a round mute button in its top-left corner. The button is listed after the canvas, so it is drawn on top of the picture. Leaving the page turns the audio off, which also hands the microphone back to the wake word.
+
+```yaml
+font:
+  # Material Design Icons; any icon font with these two glyphs works
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: icon_font_25
+    size: 25
+    glyphs:
+      - "\U000F057E"   # mdi:volume-high
+      - "\U000F0581"   # mdi:volume-off
+
+lvgl:
+  pages:
+    - id: camera_page
+      bg_color: black
+      scrollbar_mode: "off"
+      scrollable: false
+      on_unload:
+        # Only when audio is on; otherwise each page change would restart the wake word, even during music
+        - if:
+            condition:
+              switch.is_on: camera_audio_switch
+            then:
+              - switch.turn_off: camera_audio_switch
+      widgets:
+        - canvas:
+            id: cam_canvas
+            x: 0
+            y: 0
+            width: 320
+            height: 240
+
+        - button:
+            id: cam_audio_btn
+            x: 4
+            y: 4
+            width: 40
+            height: 40
+            radius: 20
+            bg_color: black
+            bg_opa: 50%
+            border_width: 0
+            shadow_width: 0
+            on_click:
+              - switch.toggle: camera_audio_switch
+            widgets:
+              - label:
+                  id: cam_audio_icon
+                  align: CENTER
+                  text_font: icon_font_25
+                  text_color: white
+                  text: "\U000F0581"   # starts muted
+```
+
+How it behaves:
+- **Muted:** a white crossed-out speaker. The wake word listens as usual.
+- **Tap to listen:** the icon turns into a green speaker. The wake word stops, then camera audio starts.
+- **Tap again, or leave the page:** camera audio stops and the wake word starts again.
+- **In sync:** the button and the Home Assistant switch always agree, because both drive the same switch.
+- **Overlays:** anything on LVGL's `top_layer`, such as a voice assistant notice bar, is drawn above the button and can cover it.
+
 ## Limitations
 
 - MJPEG only; no H.264/H.265.
-- Audio must be G.711 (PCMA/PCMU) or L16. AAC, Opus and G.726 are not decoded; let go2rtc convert them.
-- Audio and picture are not lip-synced. Each plays as soon as it arrives, which is close enough for a door camera.
+- Audio must be G.711 (PCMA/PCMU) or L16. AAC, Opus and G.726 are not decoded; ( let go2rtc convert them if you have frigate installed).
+- Audio and picture are not lip-synced. Each plays as soon as it arrives, which is close enough for a door camera in LAN.
+- On boards where the microphone and speaker share one I2S bus, such as the ESP32-S3-BOX-3, the wake word is off while camera audio plays. See [Voice assistant and micro wake word](#voice-assistant-and-micro-wake-word-shared-i2s-bus).
 - RTP over TCP only. A camera that refuses TCP transport fails at SETUP.
-- 8-bit quantisation tables only; 16-bit tables are rare.
+- 8-bit quantisation tables only.
 
 ## Tested Board-screen
 
