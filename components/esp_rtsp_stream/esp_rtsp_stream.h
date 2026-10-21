@@ -17,10 +17,6 @@
 #ifdef USE_LVGL
 #include <lvgl.h>
 #endif
-#ifdef USE_ESP_RTSP_STREAM_AUDIO
-#include <freertos/stream_buffer.h>
-#include "esphome/components/speaker/speaker.h"
-#endif
 
 #include "rfc2435.h"
 #include "rtsp_client.h"
@@ -70,14 +66,6 @@ class RtspMjpeg : public Component {
   void set_lvgl_canvas(lv_obj_t **canvas) { this->lvgl_canvas_ = canvas; }
 #endif
 
-#ifdef USE_ESP_RTSP_STREAM_AUDIO
-  void set_speaker(speaker::Speaker *speaker) { this->speaker_ = speaker; }
-  void set_audio_buffer_ms(uint32_t ms) { this->audio_buffer_ms_ = ms; }
-#endif
-  /// Turns camera audio on or off at runtime (e.g. from a switch or a button lambda).
-  void set_audio_enabled(bool enabled) { this->audio_enabled_ = enabled; }
-  bool is_audio_enabled() const { return this->audio_enabled_; }
-
   void setup() override;
   void loop() override;
   void dump_config() override;
@@ -122,13 +110,6 @@ class RtspMjpeg : public Component {
 #ifdef USE_LVGL
   void update_lvgl_canvas_(lv_obj_t *canvas);
 #endif
-#ifdef USE_ESP_RTSP_STREAM_AUDIO
-  /// SETUPs the audio track if its codec is supported. Returns false only on a transport error.
-  bool setup_audio_(const SdpTrack &track, const std::string &base);
-  bool handle_audio_rtp_(uint16_t len);
-  void pump_audio_();
-  void drain_audio_();
-#endif
   uint8_t *alloc_jpeg_buffer_(size_t bytes);
   void free_buffer_(uint8_t *buf);
 
@@ -154,37 +135,6 @@ class RtspMjpeg : public Component {
 #endif
   // False while nothing shows the stream (e.g. the canvas page is hidden): frames are not decoded.
   std::atomic<bool> frames_wanted_{true};
-  std::atomic<bool> audio_enabled_{true};
-
-#ifdef USE_ESP_RTSP_STREAM_AUDIO
-  enum class AudioCodec : uint8_t { NONE, PCMU, PCMA, L16 };
-  static constexpr size_t AUDIO_RING_SIZE = 64 * 1024;  // 4 s at 8 kHz mono
-
-  speaker::Speaker *speaker_{nullptr};
-  uint32_t audio_buffer_ms_{200};
-
-  // Set by the network task per session, read by the main loop.
-  std::atomic<AudioCodec> audio_codec_{AudioCodec::NONE};
-  std::atomic<uint32_t> audio_format_generation_{0};
-  uint32_t audio_sample_rate_{8000};
-  uint8_t audio_channels_{1};
-  uint8_t audio_rtp_channel_{2};
-  int audio_payload_type_{-1};
-  std::atomic<bool> audio_wanted_{false};
-  std::atomic<uint32_t> audio_overruns_{0};
-  uint8_t audio_packet_[4096];
-
-  StreamBufferHandle_t audio_ring_{nullptr};
-  StaticStreamBuffer_t audio_ring_struct_;
-  uint8_t *audio_ring_storage_{nullptr};
-
-  // Main loop side
-  uint8_t audio_out_[1024];
-  size_t audio_out_len_{0};
-  size_t audio_out_pos_{0};
-  bool speaker_started_{false};
-  uint32_t speaker_generation_{0};
-#endif
 
   RtspUrl parsed_url_;
   RtspConnection conn_;
