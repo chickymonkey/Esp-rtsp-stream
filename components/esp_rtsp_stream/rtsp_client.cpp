@@ -177,9 +177,9 @@ std::string RtspResponse::header(const char *name) const {
   return "";
 }
 
-bool parse_sdp(const std::string &sdp, SdpDescription &out) {
-  SdpTrack *current = nullptr;  // null: session level, or a section that is not used
-  bool in_media = false;
+bool parse_sdp_video(const std::string &sdp, SdpVideoTrack &out) {
+  enum { SESSION, VIDEO, OTHER } section = SESSION;
+  bool found = false;
   size_t pos = 0;
   while (pos < sdp.size()) {
     size_t eol = sdp.find('\n', pos);
@@ -189,54 +189,37 @@ bool parse_sdp(const std::string &sdp, SdpDescription &out) {
     pos = eol + 1;
 
     if (line.rfind("m=", 0) == 0) {
-      in_media = true;
-      // Only the first section of each kind is used.
-      if (line.rfind("m=video ", 0) == 0 && out.video.payload_type < 0) {
-        current = &out.video;
-      } else if (line.rfind("m=audio ", 0) == 0 && out.audio.payload_type < 0) {
-        current = &out.audio;
-      } else {
-        current = nullptr;
+      if (found) {
+        section = OTHER;  // only the first video track is used
         continue;
       }
-      // m=<media> <port> <proto> <fmt> ...
-      size_t fmt = line.find(' ', 2);
-      fmt = fmt == std::string::npos ? fmt : line.find(' ', fmt + 1);
-      fmt = fmt == std::string::npos ? fmt : line.find(' ', fmt + 1);
-      current->payload_type = fmt == std::string::npos ? -1 : atoi(line.c_str() + fmt + 1);
+      if (line.rfind("m=video ", 0) == 0) {
+        section = VIDEO;
+        found = true;
+        // m=video <port> <proto> <fmt> ...
+        size_t fmt = line.find(' ', 8);
+        fmt = fmt == std::string::npos ? fmt : line.find(' ', fmt + 1);
+        out.payload_type = fmt == std::string::npos ? -1 : atoi(line.c_str() + fmt + 1);
+      } else {
+        section = OTHER;
+      }
       continue;
     }
     if (line.rfind("a=control:", 0) == 0) {
-      if (!in_media)
+      if (section == SESSION)
         out.session_control = trim(line.substr(10));
-      else if (current != nullptr)
-        current->control = trim(line.substr(10));
-    } else if (current != nullptr && line.rfind("a=rtpmap:", 0) == 0) {
-      // a=rtpmap:<pt> <encoding>/<clock rate>[/<channels>]
+      else if (section == VIDEO)
+        out.control = trim(line.substr(10));
+    } else if (section == VIDEO && line.rfind("a=rtpmap:", 0) == 0) {
+      const int pt = atoi(line.c_str() + 9);
       const size_t space = line.find(' ');
-      if (atoi(line.c_str() + 9) != current->payload_type || space == std::string::npos)
-        continue;
-      const size_t slash = line.find('/', space);
-      current->encoding = line.substr(space + 1, slash == std::string::npos ? std::string::npos : slash - space - 1);
-      if (slash != std::string::npos) {
-        current->clock_rate = atoi(line.c_str() + slash + 1);
-        const size_t slash2 = line.find('/', slash + 1);
-        if (slash2 != std::string::npos)
-          current->channels = std::max(1, atoi(line.c_str() + slash2 + 1));
-      }
+      if (pt == out.payload_type && space != std::string::npos)
+        out.encoding = line.substr(space + 1, line.find('/', space) - space - 1);
     }
   }
-
-  // Static payload types (RFC 3551) need no rtpmap.
-  if (out.video.encoding.empty() && out.video.payload_type == 26) {
-    out.video.encoding = "JPEG";
-    out.video.clock_rate = 90000;
-  }
-  if (out.audio.encoding.empty() && (out.audio.payload_type == 0 || out.audio.payload_type == 8)) {
-    out.audio.encoding = out.audio.payload_type == 0 ? "PCMU" : "PCMA";
-    out.audio.clock_rate = 8000;
-  }
-  return out.video.payload_type >= 0;
+  if (found && out.encoding.empty() && out.payload_type == 26)
+    out.encoding = "JPEG";  // static payload type, rtpmap is optional
+  return found;
 }
 
 std::string resolve_control_url(const std::string &base, const std::string &control) {
