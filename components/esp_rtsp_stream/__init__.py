@@ -89,7 +89,8 @@ CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(RtspMjpeg),
-            cv.Required(CONF_URL): _validate_url,
+            # Optional: the URL can also be set at runtime with set_url(), e.g. from Home Assistant.
+            cv.Optional(CONF_URL): _validate_url,
             cv.Inclusive(CONF_USERNAME, "credentials"): cv.string_strict,
             cv.Inclusive(CONF_PASSWORD, "credentials"): cv.string_strict,
             cv.Optional(CONF_MAX_FPS): cv.int_range(min=1, max=30),
@@ -138,7 +139,8 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
-    cg.add(var.set_url(config[CONF_URL]))
+    if CONF_URL in config:
+        cg.add(var.set_url(config[CONF_URL]))
     if CONF_USERNAME in config:
         cg.add(var.set_credentials(config[CONF_USERNAME], config[CONF_PASSWORD]))
     cg.add(var.set_max_fps(config.get(CONF_MAX_FPS, profile["max_fps"])))

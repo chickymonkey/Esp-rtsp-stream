@@ -36,11 +36,11 @@ namespace esp_rtsp_stream {
 /// the picture never lags behind the camera. Decoded frames are double-buffered for draw().
 class RtspMjpeg : public Component {
  public:
-  void set_url(const std::string &url) { this->url_ = url; }
-  void set_credentials(const std::string &username, const std::string &password) {
-    this->username_ = username;
-    this->password_ = password;
-  }
+  /// Sets the camera URL; safe to call at runtime (e.g. from a Home Assistant text sensor) and reconnects to
+  /// the new camera. Invalid values such as "unavailable" are ignored, so the current stream keeps running.
+  void set_url(const std::string &url);
+  /// Default login, used when the URL itself carries no user:pass@. Also safe to call at runtime.
+  void set_credentials(const std::string &username, const std::string &password);
   void set_max_fps(int fps) { this->max_fps_ = fps; }
   void set_output_size(int width, int height) {
     this->box_width_ = width;
@@ -95,6 +95,10 @@ class RtspMjpeg : public Component {
   static void network_task_(void *arg);
   static void decode_task_(void *arg);
   void network_loop_();
+  /// Takes the latest URL/credentials into the network task. Returns false if there is no usable URL yet.
+  bool apply_config_();
+  /// Tells the network task that the URL or credentials changed.
+  void request_reconnect_();
   void decode_loop_();
 
   /// Runs one RTSP session until it fails. Returns true if at least one frame was received.
@@ -114,9 +118,12 @@ class RtspMjpeg : public Component {
   void free_buffer_(uint8_t *buf);
 
   // Configuration
+  // Written by set_url()/set_credentials() on the main loop, read by the network task.
+  std::mutex config_mutex_;
   std::string url_;
   std::string username_;
   std::string password_;
+  std::atomic<bool> config_changed_{false};
   int max_fps_{10};
   int box_width_{0};
   int box_height_{0};

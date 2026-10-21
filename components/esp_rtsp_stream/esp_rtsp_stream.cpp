@@ -28,19 +28,41 @@ static const char *const DECODER_NAME = "ESP32-P4 hardware JPEG + PPA scaler";
 static const char *const DECODER_NAME = "esp_new_jpeg (software, SIMD on ESP32-S3)";
 #endif
 
-void RtspMjpeg::setup() {
+void RtspMjpeg::set_url(const std::string &url) {
+  RtspUrl parsed;
   const char *error = "";
-  if (!parse_rtsp_url(this->url_, this->parsed_url_, &error)) {
-    ESP_LOGE(TAG, "Invalid URL: %s", error);
-    this->mark_failed();
+  if (!parse_rtsp_url(url, parsed, &error)) {
+    // Home Assistant sends "unknown"/"unavailable" while it restarts; keep the current camera.
+    ESP_LOGW(TAG, "Ignoring camera URL '%s': %s", url.c_str(), error);
     return;
   }
-  if (!this->username_.empty()) {
-    this->parsed_url_.username = this->username_;
-    this->parsed_url_.password = this->password_;
+  {
+    std::lock_guard<std::mutex> lock(this->config_mutex_);
+    if (url == this->url_)
+      return;  // Home Assistant re-sends the same state on reconnect; don't drop the stream for it
+    this->url_ = url;
   }
-  this->conn_.set_credentials(this->parsed_url_.username, this->parsed_url_.password);
+  this->request_reconnect_();
+}
 
+void RtspMjpeg::set_credentials(const std::string &username, const std::string &password) {
+  {
+    std::lock_guard<std::mutex> lock(this->config_mutex_);
+    if (username == this->username_ && password == this->password_)
+      return;
+    this->username_ = username;
+    this->password_ = password;
+  }
+  this->request_reconnect_();
+}
+
+void RtspMjpeg::request_reconnect_() {
+  this->config_changed_ = true;
+  if (this->network_task_handle_ != nullptr)
+    xTaskNotifyGive(this->network_task_handle_);  // cut a reconnect wait short
+}
+
+void RtspMjpeg::setup() {
   for (auto &buf : this->jpeg_buffers_) {
     buf = this->alloc_jpeg_buffer_(this->max_frame_size_);
     if (buf == nullptr) {
@@ -100,8 +122,18 @@ void RtspMjpeg::loop() {
 
 void RtspMjpeg::dump_config() {
   ESP_LOGCONFIG(TAG, "RTSP MJPEG stream:");
-  ESP_LOGCONFIG(TAG, "  URL: %s", this->parsed_url_.uri.c_str());
-  ESP_LOGCONFIG(TAG, "  Authentication: %s", this->parsed_url_.username.empty() ? "none" : "Basic/Digest");
+  {
+    std::lock_guard<std::mutex> lock(this->config_mutex_);
+    RtspUrl parsed;
+    const char *error = "";
+    if (parse_rtsp_url(this->url_, parsed, &error)) {
+      ESP_LOGCONFIG(TAG, "  URL: %s", parsed.uri.c_str());  // printed without the password
+      ESP_LOGCONFIG(TAG, "  Authentication: %s",
+                    parsed.username.empty() && this->username_.empty() ? "none" : "Basic/Digest");
+    } else {
+      ESP_LOGCONFIG(TAG, "  URL: not set yet (waiting for set_url)");
+    }
+  }
   ESP_LOGCONFIG(TAG, "  Decoder: %s", DECODER_NAME);
   ESP_LOGCONFIG(TAG, "  Max FPS: %d", this->max_fps_);
   if (this->box_width_ > 0)
@@ -116,20 +148,57 @@ void RtspMjpeg::dump_config() {
 
 void RtspMjpeg::network_task_(void *arg) { static_cast<RtspMjpeg *>(arg)->network_loop_(); }
 
+bool RtspMjpeg::apply_config_() {
+  std::string url, username, password;
+  {
+    std::lock_guard<std::mutex> lock(this->config_mutex_);
+    url = this->url_;
+    username = this->username_;
+    password = this->password_;
+  }
+  RtspUrl parsed;
+  const char *error = "";
+  if (url.empty() || !parse_rtsp_url(url, parsed, &error))
+    return false;
+  // Credentials in the URL win, so a URL from Home Assistant can point at a camera with its own login.
+  if (parsed.username.empty()) {
+    parsed.username = username;
+    parsed.password = password;
+  }
+  this->parsed_url_ = parsed;
+  this->conn_.set_credentials(parsed.username, parsed.password);
+  ESP_LOGI(TAG, "Camera: %s", parsed.uri.c_str());
+  return true;
+}
+
 void RtspMjpeg::network_loop_() {
   uint32_t backoff_ms = 1000;
+  bool have_url = false;
   while (true) {
+    if (this->config_changed_.exchange(false)) {
+      have_url = this->apply_config_();
+      backoff_ms = 1000;
+    }
+    if (!have_url) {
+      ESP_LOGI(TAG, "No camera URL yet; waiting for set_url()");
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+      continue;
+    }
     if (!network::is_connected()) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
       continue;
     }
     const bool got_frames = this->run_session_();
     this->conn_.close();
     this->assembler_.abandon();
     this->streaming_ = false;
+    if (this->config_changed_) {
+      ESP_LOGI(TAG, "Camera URL changed, switching");
+      continue;
+    }
     backoff_ms = got_frames ? 1000 : std::min<uint32_t>(backoff_ms * 2, 30000);
     ESP_LOGW(TAG, "Stream stopped, reconnecting in %u s", (unsigned) (backoff_ms / 1000));
-    vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(backoff_ms));
   }
 }
 
@@ -212,6 +281,8 @@ bool RtspMjpeg::run_session_() {
   uint32_t last_keepalive_ms = millis();
   size_t garbage = 0;
   while (true) {
+    if (this->config_changed_)
+      break;  // new camera URL: drop this session
     if (millis() - last_keepalive_ms > keepalive_ms) {
       if (!this->conn_.send_only("OPTIONS", url.uri, ""))
         break;

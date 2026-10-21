@@ -159,8 +159,38 @@ go2rtc:
 
 Then use `url: rtsp://FRIGATE_IP:8554/porch_esp`. This also lets the ESP32 show a main-stream (H.264) camera, at the cost of transcoding on the server.
 
+## Changing the camera at runtime
+
+`url` is optional. The URL can come from Home Assistant instead, so switching cameras needs no reflash:
+
+```yaml
+esp_rtsp_stream:
+  - id: front_door
+    username: viewer                   # default login when the URL has none
+    password: !secret camera_password
+    lvgl_canvas: cam_canvas
+
+text_sensor:
+  - platform: homeassistant
+    id: cam_url
+    entity_id: input_text.esp_camera_url
+    on_value:
+      - lambda: id(front_door).set_url(x);
+```
+
+What happens on `set_url()`:
+- **Valid new URL:** the component drops the current session and connects to the new camera straight away.
+- **Same URL again:** ignored, so a Home Assistant reconnect doesn't interrupt the picture.
+- **Invalid value** (e.g. `unavailable` while Home Assistant restarts): ignored, and the current camera keeps streaming.
+- **No URL yet** (none in YAML, Home Assistant not connected): the component waits.
+
+**Login:** credentials in the URL (`rtsp://user:pass@host/...`) take precedence over `username`/`password`. One `input_text` can therefore switch between cameras with different logins. Note that the password is then visible in Home Assistant.
+
+`set_credentials(user, pass)` is also available at runtime.
+
 ## C++ API
 
+- `set_url(url)`, `set_credentials(user, pass)`: switch camera at runtime.
 - `draw(it)` / `draw(it, x, y)`: draw the newest frame.
 - `has_frame()`, `is_streaming()`, `get_frame_width()`, `get_frame_height()`
 - `get_frame_count()`, `get_dropped_frames()`, `get_last_decode_ms()`
