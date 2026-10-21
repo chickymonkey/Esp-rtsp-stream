@@ -18,6 +18,10 @@
 #include <lvgl.h>
 #endif
 
+#ifdef USE_ESP_RTSP_STREAM_AUDIO
+#include "esphome/components/speaker/speaker.h"
+#endif
+#include "audio_rtp.h"
 #include "rfc2435.h"
 #include "rtsp_client.h"
 
@@ -53,6 +57,17 @@ class RtspMjpeg : public Component {
     this->decode_core_ = decode_core;
   }
   void set_log_frame_info(bool enabled) { this->log_frame_info_ = enabled; }
+#ifdef USE_ESP_RTSP_STREAM_AUDIO
+  /// Plays the camera's audio track on this speaker.
+  void set_speaker(speaker::Speaker *speaker) { this->speaker_ = speaker; }
+  /// Rate the speaker runs at; camera audio is converted to it.
+  void set_audio_sample_rate(uint32_t rate) { this->audio_sample_rate_ = rate; }
+#endif
+  /// Mutes or unmutes the camera audio. Safe to call at runtime; the RTSP session is not interrupted.
+  void set_audio_muted(bool muted) { this->audio_muted_ = muted; }
+  bool is_audio_muted() const { return this->audio_muted_; }
+  /// True while camera audio is being sent to the speaker.
+  bool is_audio_playing() const { return this->audio_wanted_; }
 #ifdef USE_DISPLAY
   void set_display(display::Display *display) { this->display_ = display; }
 
@@ -104,6 +119,10 @@ class RtspMjpeg : public Component {
   /// Runs one RTSP session until it fails. Returns true if at least one frame was received.
   bool run_session_();
   bool handle_rtp_(uint16_t len);
+  /// Reads one interleaved audio packet and plays it.
+  bool handle_audio_rtp_(uint16_t len);
+  /// Starts or stops the speaker to match the session and mute state. Main loop only.
+  void update_audio_();
   void frame_complete_(size_t jpeg_len);
 
   OutputPlan plan_output_(int src_width, int src_height) const;
@@ -157,6 +176,26 @@ class RtspMjpeg : public Component {
   uint8_t qtables_[256];
   uint32_t next_frame_due_ms_{0};
   uint32_t session_frames_{0};
+
+  // Audio. The network task decodes packets and hands them to the speaker; the main loop starts and stops it.
+  RtpAudioDecoder audio_decoder_;
+  uint8_t audio_channel_{255};  // interleaved channel of the audio track, 255 when there is none
+  int audio_payload_type_{-1};
+  uint8_t *audio_packet_{nullptr};
+  int16_t *audio_pcm_{nullptr};
+  size_t audio_pcm_capacity_{0};
+  std::atomic<bool> audio_track_active_{false};  // this session has an audio track
+  std::atomic<bool> audio_wanted_{false};        // the speaker is started for us
+  std::atomic<bool> audio_muted_{false};
+  std::atomic<uint32_t> audio_packets_{0};
+  std::atomic<uint32_t> audio_dropped_samples_{0};
+  uint32_t audio_sample_rate_{16000};
+  bool audio_unsupported_logged_{false};
+#ifdef USE_ESP_RTSP_STREAM_AUDIO
+  speaker::Speaker *speaker_{nullptr};
+  bool speaker_started_{false};
+  uint32_t last_audio_start_ms_{0};
+#endif
 
   // JPEG hand-off: the network task fills jpeg_buffers_[fill_index_]; the decoder reads the other one.
   uint8_t *jpeg_buffers_[2]{nullptr, nullptr};
