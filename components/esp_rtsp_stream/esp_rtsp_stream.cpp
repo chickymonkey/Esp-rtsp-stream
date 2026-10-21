@@ -28,12 +28,6 @@ static const char *const DECODER_NAME = "ESP32-P4 hardware JPEG + PPA scaler";
 static const char *const DECODER_NAME = "esp_new_jpeg (software, SIMD on ESP32-S3)";
 #endif
 
-/// RTP channel from a "Transport: ...;interleaved=a-b" header.
-static uint8_t interleaved_channel(const std::string &transport, uint8_t fallback) {
-  const size_t pos = transport.find("interleaved=");
-  return pos == std::string::npos ? fallback : static_cast<uint8_t>(atoi(transport.c_str() + pos + 12));
-}
-
 void RtspMjpeg::setup() {
   const char *error = "";
   if (!parse_rtsp_url(this->url_, this->parsed_url_, &error)) {
@@ -55,21 +49,6 @@ void RtspMjpeg::setup() {
       return;
     }
   }
-
-#ifdef USE_ESP_RTSP_STREAM_AUDIO
-  if (this->speaker_ != nullptr) {
-    // Jitter buffer between the network task (writer) and the main loop (reader), in PSRAM.
-    this->audio_ring_storage_ = static_cast<uint8_t *>(heap_caps_malloc(AUDIO_RING_SIZE + 1, MALLOC_CAP_SPIRAM));
-    if (this->audio_ring_storage_ != nullptr) {
-      this->audio_ring_ = xStreamBufferCreateStatic(AUDIO_RING_SIZE, 1, this->audio_ring_storage_,
-                                                    &this->audio_ring_struct_);
-    }
-    if (this->audio_ring_ == nullptr) {
-      ESP_LOGE(TAG, "Cannot allocate the audio buffer; audio disabled");
-      this->speaker_ = nullptr;
-    }
-  }
-#endif
 
   if (xTaskCreatePinnedToCore(decode_task_, "rtsp_dec", 8192, this, 1, &this->decode_task_handle_,
                               this->decode_core_) != pdPASS ||
@@ -103,9 +82,6 @@ void RtspMjpeg::loop() {
       this->update_lvgl_canvas_(canvas);
   }
 #endif
-#ifdef USE_ESP_RTSP_STREAM_AUDIO
-  this->pump_audio_();
-#endif
 
   const uint32_t now = millis();
   if (this->log_frame_info_ && now - this->last_stats_ms_ >= 30000) {
@@ -133,12 +109,6 @@ void RtspMjpeg::dump_config() {
   ESP_LOGCONFIG(TAG, "  Rotation: %d", this->rotation_);
   ESP_LOGCONFIG(TAG, "  Max frame size: %u bytes", (unsigned) this->max_frame_size_);
   ESP_LOGCONFIG(TAG, "  Tasks: network on core %d, decode on core %d", this->network_core_, this->decode_core_);
-#ifdef USE_ESP_RTSP_STREAM_AUDIO
-  if (this->speaker_ != nullptr) {
-    ESP_LOGCONFIG(TAG, "  Audio: G.711/L16 to speaker, %u ms buffer, %s", (unsigned) this->audio_buffer_ms_,
-                  this->audio_enabled_ ? "enabled" : "disabled");
-  }
-#endif
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -183,27 +153,27 @@ bool RtspMjpeg::run_session_() {
     return false;
   }
 
-  SdpDescription sdp;
-  if (!parse_sdp(resp.body, sdp)) {
+  SdpVideoTrack track;
+  if (!parse_sdp_video(resp.body, track)) {
     ESP_LOGE(TAG, "Camera offers no video track");
     return false;
   }
-  if (strcasecmp(sdp.video.encoding.c_str(), "JPEG") != 0) {
+  if (strcasecmp(track.encoding.c_str(), "JPEG") != 0) {
     ESP_LOGE(TAG, "Stream is %s, not MJPEG. Set this camera stream's encoding to MJPEG (usually the sub-stream)",
-             sdp.video.encoding.empty() ? "an unknown codec" : sdp.video.encoding.c_str());
+             track.encoding.empty() ? "an unknown codec" : track.encoding.c_str());
     return false;
   }
-  this->video_payload_type_ = sdp.video.payload_type;
+  this->video_payload_type_ = track.payload_type;
 
   std::string base = resp.header("Content-Base");
   if (base.empty())
     base = resp.header("Content-Location");
   if (base.empty())
     base = url.uri;
-  const std::string play_uri = resolve_control_url(base, sdp.session_control);
+  const std::string setup_uri = resolve_control_url(base, track.control);
+  const std::string play_uri = resolve_control_url(base, track.session_control);
 
-  if (!this->conn_.request("SETUP", resolve_control_url(base, sdp.video.control),
-                           "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n", resp))
+  if (!this->conn_.request("SETUP", setup_uri, "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n", resp))
     return false;
   if (resp.status != 200) {
     ESP_LOGE(TAG, "SETUP failed with %d; the camera may not allow RTP over TCP", resp.status);
@@ -219,13 +189,10 @@ bool RtspMjpeg::run_session_() {
       timeout_s = std::max(10, atoi(session.c_str() + t + 8));
     session.resize(semi);
   }
-  this->rtp_channel_ = interleaved_channel(resp.header("Transport"), 0);
+  const std::string transport = resp.header("Transport");
+  const size_t interleaved = transport.find("interleaved=");
+  this->rtp_channel_ = interleaved == std::string::npos ? 0 : atoi(transport.c_str() + interleaved + 12);
   this->conn_.set_session(session);
-
-#ifdef USE_ESP_RTSP_STREAM_AUDIO
-  if (!this->setup_audio_(sdp.audio, base))
-    return false;
-#endif
 
   if (!this->conn_.request("PLAY", play_uri, "Range: npt=0.000-\r\n", resp))
     return false;
@@ -259,16 +226,7 @@ bool RtspMjpeg::run_session_() {
       if (!this->conn_.read_exact(hdr, sizeof(hdr)))
         break;
       const uint16_t len = (hdr[1] << 8) | hdr[2];
-      bool ok;
-      if (hdr[0] == this->rtp_channel_) {
-        ok = this->handle_rtp_(len);
-#ifdef USE_ESP_RTSP_STREAM_AUDIO
-      } else if (hdr[0] == this->audio_rtp_channel_ && this->audio_codec_ != AudioCodec::NONE) {
-        ok = this->handle_audio_rtp_(len);
-#endif
-      } else {
-        ok = this->conn_.skip(len);
-      }
+      const bool ok = hdr[0] == this->rtp_channel_ ? this->handle_rtp_(len) : this->conn_.skip(len);
       if (!ok)
         break;
       garbage = 0;
@@ -428,194 +386,6 @@ void RtspMjpeg::frame_complete_(size_t jpeg_len) {
   this->decoder_busy_ = true;
   xTaskNotifyGive(this->decode_task_handle_);
 }
-
-// ---------------------------------------------------------------------------------------------------------------
-// Audio
-
-#ifdef USE_ESP_RTSP_STREAM_AUDIO
-
-// ITU-T G.711 expansion (the classic Sun reference implementation).
-static int16_t ulaw_to_pcm(uint8_t u) {
-  u = ~u;
-  int t = ((u & 0x0F) << 3) + 0x84;
-  t <<= (u & 0x70) >> 4;
-  return static_cast<int16_t>((u & 0x80) ? (0x84 - t) : (t - 0x84));
-}
-
-static int16_t alaw_to_pcm(uint8_t a) {
-  a ^= 0x55;
-  int t = (a & 0x0F) << 4;
-  const int seg = (a & 0x70) >> 4;
-  if (seg == 0) {
-    t += 8;
-  } else {
-    t += 0x108;
-    if (seg > 1)
-      t <<= seg - 1;
-  }
-  return static_cast<int16_t>((a & 0x80) ? t : -t);
-}
-
-bool RtspMjpeg::setup_audio_(const SdpTrack &track, const std::string &base) {
-  this->audio_codec_ = AudioCodec::NONE;
-  if (this->speaker_ == nullptr || track.payload_type < 0)
-    return true;
-
-  AudioCodec codec;
-  if (strcasecmp(track.encoding.c_str(), "PCMU") == 0) {
-    codec = AudioCodec::PCMU;
-  } else if (strcasecmp(track.encoding.c_str(), "PCMA") == 0) {
-    codec = AudioCodec::PCMA;
-  } else if (strcasecmp(track.encoding.c_str(), "L16") == 0) {
-    codec = AudioCodec::L16;
-  } else {
-    ESP_LOGW(TAG, "Camera audio is %s; only G.711 (PCMU/PCMA) and L16 are supported. Set the camera's audio "
-                  "encoding to G.711 to hear it",
-             track.encoding.empty() ? "an unknown codec" : track.encoding.c_str());
-    return true;
-  }
-  const uint32_t rate = track.clock_rate > 0 ? track.clock_rate : 8000;
-  const uint8_t channels = std::min(2, std::max(1, track.channels));
-
-  RtspResponse resp;
-  if (!this->conn_.request("SETUP", resolve_control_url(base, track.control),
-                           "Transport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n", resp))
-    return false;  // transport error: the session is unusable
-  if (resp.status != 200) {
-    ESP_LOGW(TAG, "Audio SETUP failed with %d; continuing without audio", resp.status);
-    return true;
-  }
-  this->audio_rtp_channel_ = interleaved_channel(resp.header("Transport"), 2);
-  this->audio_payload_type_ = track.payload_type;
-  if (rate != this->audio_sample_rate_ || channels != this->audio_channels_) {
-    this->audio_sample_rate_ = rate;
-    this->audio_channels_ = channels;
-    this->audio_format_generation_++;  // tells the main loop to restart the speaker with the new format
-  }
-  this->audio_codec_ = codec;
-  ESP_LOGI(TAG, "Audio: %s, %u Hz, %u channel(s)", track.encoding.c_str(), (unsigned) rate, channels);
-  return true;
-}
-
-bool RtspMjpeg::handle_audio_rtp_(uint16_t len) {
-  if (len < 12 || len > sizeof(this->audio_packet_))
-    return this->conn_.skip(len);
-  if (!this->conn_.read_exact(this->audio_packet_, len))
-    return false;
-  if (!this->audio_wanted_)
-    return true;
-
-  const uint8_t *p = this->audio_packet_;
-  size_t start = 12 + (p[0] & 0x0F) * 4;
-  if ((p[0] & 0x10) && start + 4 <= len)
-    start += 4 + ((p[start + 2] << 8) | p[start + 3]) * 4;
-  size_t end = len;
-  if (p[0] & 0x20)
-    end -= std::min<size_t>(p[len - 1], len);
-  if ((p[1] & 0x7F) != this->audio_payload_type_ || start >= end)
-    return true;
-
-  // Decode to little-endian 16-bit PCM in chunks. A chunk that does not fit is dropped whole, so the
-  // buffer only ever holds complete frames.
-  int16_t pcm[256];
-  size_t count = 0;
-  auto flush = [&]() {
-    const size_t bytes = count * sizeof(int16_t);
-    if (xStreamBufferSpacesAvailable(this->audio_ring_) >= bytes) {
-      xStreamBufferSend(this->audio_ring_, pcm, bytes, 0);
-    } else {
-      this->audio_overruns_++;
-    }
-    count = 0;
-  };
-  if (this->audio_codec_ == AudioCodec::L16) {
-    for (size_t i = start; i + 1 < end; i += 2) {
-      pcm[count++] = static_cast<int16_t>((p[i] << 8) | p[i + 1]);  // network byte order
-      if (count == 256)
-        flush();
-    }
-  } else {
-    const bool ulaw = this->audio_codec_ == AudioCodec::PCMU;
-    for (size_t i = start; i < end; i++) {
-      pcm[count++] = ulaw ? ulaw_to_pcm(p[i]) : alaw_to_pcm(p[i]);
-      if (count == 256)
-        flush();
-    }
-  }
-  if (count > 0)
-    flush();
-  return true;
-}
-
-void RtspMjpeg::drain_audio_() {
-  uint8_t scratch[256];
-  while (xStreamBufferReceive(this->audio_ring_, scratch, sizeof(scratch), 0) > 0) {
-  }
-  this->audio_out_len_ = this->audio_out_pos_ = 0;
-}
-
-void RtspMjpeg::pump_audio_() {
-  if (this->speaker_ == nullptr || this->audio_ring_ == nullptr)
-    return;
-
-  // Audio follows the picture: off when disabled, when the stream is down or while the canvas is hidden.
-  const bool wanted = this->audio_enabled_ && this->streaming_ && this->frames_wanted_ &&
-                      this->audio_codec_ != AudioCodec::NONE;
-  this->audio_wanted_ = wanted;
-  const uint32_t generation = this->audio_format_generation_;
-  if (!wanted || generation != this->speaker_generation_) {
-    if (this->speaker_started_) {
-      this->speaker_->stop();
-      this->speaker_started_ = false;
-    }
-    this->drain_audio_();
-    this->speaker_generation_ = generation;
-    return;
-  }
-
-  const size_t frame_bytes = 2 * this->audio_channels_;
-  const size_t bytes_per_ms = this->audio_sample_rate_ * frame_bytes / 1000;
-  const size_t target_bytes = this->audio_buffer_ms_ * bytes_per_ms;
-  const size_t available = xStreamBufferBytesAvailable(this->audio_ring_);
-
-  if (!this->speaker_started_) {
-    if (available < target_bytes)
-      return;  // pre-buffer to ride out network jitter
-    this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, this->audio_channels_, this->audio_sample_rate_));
-    this->speaker_->start();
-    this->speaker_started_ = true;
-  }
-
-  // The camera clock and the I2S clock drift apart. If audio piles up, skip ahead to keep the delay bounded.
-  if (available > 3 * target_bytes) {
-    size_t excess = (available - target_bytes) / frame_bytes * frame_bytes;
-    uint8_t scratch[256];
-    while (excess > 0) {
-      const size_t n = xStreamBufferReceive(this->audio_ring_, scratch, std::min(excess, sizeof(scratch)), 0);
-      if (n == 0)
-        break;
-      excess -= n;
-    }
-  }
-
-  // Feed whatever the speaker accepts without blocking the main loop.
-  const size_t chunk = sizeof(this->audio_out_) / frame_bytes * frame_bytes;
-  for (int i = 0; i < 8; i++) {
-    if (this->audio_out_pos_ == this->audio_out_len_) {
-      this->audio_out_len_ = xStreamBufferReceive(this->audio_ring_, this->audio_out_, chunk, 0);
-      this->audio_out_pos_ = 0;
-      if (this->audio_out_len_ == 0)
-        break;
-    }
-    const size_t written = this->speaker_->play(this->audio_out_ + this->audio_out_pos_,
-                                                this->audio_out_len_ - this->audio_out_pos_, 0);
-    this->audio_out_pos_ += written;
-    if (written == 0)
-      break;
-  }
-}
-
-#endif
 
 // ---------------------------------------------------------------------------------------------------------------
 // Decode task
