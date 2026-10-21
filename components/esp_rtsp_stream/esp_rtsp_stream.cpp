@@ -455,17 +455,11 @@ RtspMjpeg::OutputPlan RtspMjpeg::plan_output_(int src_width, int src_height) con
   plan.scaled_width = static_cast<int>(plan.scale * src_width);
   plan.scaled_height = static_cast<int>(plan.scale * src_height);
 #else
-  // Only ask esp_new_jpeg for the 1/2, 1/4, 1/8 reductions a JPEG decoder does natively, and only when the
-  // result stays a multiple of 8 and no smaller than the target; finish_frame_() does the rest.
-  int factor = 1;
-  for (int f = 2; f <= 8; f *= 2) {
-    if (src_width % (8 * f) == 0 && src_height % (8 * f) == 0 && src_width / f >= plan.target_width &&
-        src_height / f >= plan.target_height)
-      factor = f;
-  }
+  // esp_new_jpeg always decodes at full size: its scale option produced frames whose layout did not match
+  // the size it reported (left/right halves stacked). finish_frame_() halves and resizes instead.
   plan.scale = scale;
-  plan.scaled_width = src_width / factor;
-  plan.scaled_height = src_height / factor;
+  plan.scaled_width = src_width;
+  plan.scaled_height = src_height;
 #endif
   plan.stage_width = swap ? plan.scaled_height : plan.scaled_width;
   plan.stage_height = swap ? plan.scaled_width : plan.scaled_height;
@@ -666,13 +660,9 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
   const int back = this->front_ ^ 1;
   // The RTP header gives the size up front; a pass-through JPEG might differ, so retry once with the real size.
   for (int attempt = 0; attempt < 2; attempt++) {
-    OutputPlan plan = this->plan_output_(src_width, src_height);
+    const OutputPlan plan = this->plan_output_(src_width, src_height);
     jpeg_dec_config_t cfg = DEFAULT_JPEG_DEC_CONFIG();
     cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
-    if (plan.scaled_width != src_width || plan.scaled_height != src_height) {
-      cfg.scale.width = plan.scaled_width;
-      cfg.scale.height = plan.scaled_height;
-    }
     cfg.rotate = this->rotation_ == 90    ? JPEG_ROTATE_90D
                  : this->rotation_ == 180 ? JPEG_ROTATE_180D
                  : this->rotation_ == 270 ? JPEG_ROTATE_270D
@@ -696,23 +686,14 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
     int out_len = 0;
     if (err == JPEG_ERR_OK)
       err = jpeg_dec_get_outbuf_len(decoder, &out_len);
-    // Trust the decoder's output size, not our request: it may decline a scale and decode at full size.
-    const bool scaling = plan.scaled_width != src_width || plan.scaled_height != src_height;
-    if (err == JPEG_ERR_OK && out_len < plan.scaled_width * plan.scaled_height * 2) {
-      ESP_LOGW(TAG, "Unexpected decoder output size %d for %dx%d", out_len, src_width, src_height);
-      err = JPEG_ERR_FAIL;
-    }
-    if (err == JPEG_ERR_OK && scaling && out_len >= src_width * src_height * 2) {
+    // The frame is read back as stage_width x stage_height pixels; anything else would scramble the picture.
+    if (err == JPEG_ERR_OK && out_len != plan.stage_width * plan.stage_height * 2) {
       if (!this->scale_fallback_logged_) {
         this->scale_fallback_logged_ = true;
-        ESP_LOGD(TAG, "Decoder ignored scale %dx%d, scaling %dx%d in software", plan.scaled_width,
-                 plan.scaled_height, src_width, src_height);
+        ESP_LOGW(TAG, "Decoder output is %d bytes, expected %dx%d; dropping frames", out_len, plan.stage_width,
+                 plan.stage_height);
       }
-      const bool swap = this->rotation_ == 90 || this->rotation_ == 270;
-      plan.scaled_width = src_width;
-      plan.scaled_height = src_height;
-      plan.stage_width = swap ? src_height : src_width;
-      plan.stage_height = swap ? src_width : src_height;
+      err = JPEG_ERR_FAIL;
     }
 
     // Decode straight into the frame buffer when the decoder hits the exact size, else into scaled_.
