@@ -99,11 +99,73 @@ psram:
 
 The display section is the same as for the S3, typically with a `mipi_dsi` panel. For a portrait 800×1280 panel showing a landscape camera, use `rotation: 90` and `output_width: 800` / `output_height: 1280`.
 
+## Audio
+
+The camera's audio track is played on an ESPHome `speaker`. It arrives on the same RTSP connection as the video.
+
+```yaml
+esp_rtsp_stream:
+  - id: front_door
+    # ...
+    audio:
+      speaker: cam_speaker      # required
+      enabled: true             # initial state; change it with id(front_door).set_audio_enabled(...)
+      buffer_duration: 200ms    # jitter buffer, 60ms-1s
+```
+
+**Supported codecs:** G.711 µ-law (PCMU), G.711 A-law (PCMA) and L16, at any sample rate the camera announces (8 kHz or 16 kHz). AAC, G.726 and Opus are not supported; the log says so if the camera sends one.
+
+| Camera | Setting |
+|---|---|
+| Hikvision | Video/Audio → Video → sub-stream *Stream Type: Video & Audio*; Video/Audio → Audio → *Audio Encoding: G.711ulaw* |
+| Dahua | Camera → Audio → enable audio on the sub-stream, *Encode Mode: G.711A* (or G.711Mu) |
+
+**When audio plays:** only while the picture does. It stops while the `lvgl_canvas` page is hidden, while the stream is down, or when disabled. If audio and video clocks drift apart, the buffer skips ahead so the delay stays under ~3× `buffer_duration`.
+
+**Sharing the speaker:** the camera runs at 8 or 16 kHz, while the S3-Box speaker runs at 48 kHz and is also used by the media player. Put a `resampler` in front of a `mixer` input so both can play:
+
+```yaml
+speaker:
+  - platform: i2s_audio
+    id: box_speaker
+    # ... unchanged
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: box_speaker
+    source_speakers:
+      - id: media_mixing_input
+      - id: cam_mixing_input
+  - platform: resampler
+    id: cam_speaker               # esp_rtsp_stream -> audio -> speaker
+    output_speaker: cam_mixing_input
+
+media_player:
+  - platform: speaker
+    # ...
+    announcement_pipeline:
+      speaker: media_mixing_input   # was box_speaker
+      format: FLAC
+      sample_rate: 48000
+      num_channels: 1
+```
+
+**Using go2rtc / Frigate instead:** the ESP32 can't transcode, so it can't use the `#audio=opus` stream directly. go2rtc can transcode for it, and the component can read go2rtc's RTSP restream instead of the camera:
+
+```yaml
+go2rtc:
+  streams:
+    porch_esp:
+      - "ffmpeg:PorchDahuaFrigate#video=mjpeg#audio=pcmu"
+```
+
+Then use `url: rtsp://FRIGATE_IP:8554/porch_esp`. This also lets the ESP32 show a main-stream (H.264) camera, at the cost of transcoding on the server.
+
 ## C++ API
 
 - `draw(it)` / `draw(it, x, y)`: draw the newest frame.
 - `has_frame()`, `is_streaming()`, `get_frame_width()`, `get_frame_height()`
 - `get_frame_count()`, `get_dropped_frames()`, `get_last_decode_ms()`
+- `set_audio_enabled(bool)`, `is_audio_enabled()`
 
 ## Limitations
 

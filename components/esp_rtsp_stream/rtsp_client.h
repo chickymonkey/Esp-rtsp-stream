@@ -26,15 +26,22 @@ struct RtspResponse {
   std::string header(const char *name) const;
 };
 
-struct SdpVideoTrack {
-  int payload_type{-1};
-  std::string encoding;         // from a=rtpmap, e.g. "JPEG" or "H264"
-  std::string control;          // media-level a=control
-  std::string session_control;  // session-level a=control
+struct SdpTrack {
+  int payload_type{-1};  // -1: no such track
+  std::string encoding;  // from a=rtpmap, e.g. "JPEG", "H264", "PCMU"
+  int clock_rate{0};
+  int channels{1};
+  std::string control;  // media-level a=control
 };
 
-/// Picks the first m=video section of an SDP body.
-bool parse_sdp_video(const std::string &sdp, SdpVideoTrack &out);
+struct SdpDescription {
+  std::string session_control;  // session-level a=control
+  SdpTrack video;               // first m=video section
+  SdpTrack audio;               // first m=audio section
+};
+
+/// Picks the first video and first audio section of an SDP body. Returns false if there is no video.
+bool parse_sdp(const std::string &sdp, SdpDescription &out);
 /// Resolves an a=control value against the DESCRIBE base URL (RFC 2326 C.1.1).
 std::string resolve_control_url(const std::string &base, const std::string &control);
 

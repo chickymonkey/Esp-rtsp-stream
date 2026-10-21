@@ -1,12 +1,14 @@
 import esphome.codegen as cg
-from esphome.components import display, esp32
+from esphome.components import display, esp32, speaker
 from esphome.components.esp32.const import VARIANT_ESP32P4, VARIANT_ESP32S3
 import esphome.config_validation as cv
 from esphome.const import (
+    CONF_BUFFER_DURATION,
     CONF_DISPLAY_ID,
     CONF_ID,
     CONF_PASSWORD,
     CONF_ROTATION,
+    CONF_SPEAKER,
     CONF_URL,
     CONF_USERNAME,
 )
@@ -29,6 +31,21 @@ CONF_OUTPUT_HEIGHT = "output_height"
 CONF_MAX_FRAME_SIZE = "max_frame_size"
 CONF_LOG_FRAME_INFO = "log_frame_info"
 CONF_LVGL_CANVAS = "lvgl_canvas"
+CONF_AUDIO = "audio"
+CONF_ENABLED = "enabled"
+
+AUDIO_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_SPEAKER): cv.use_id(speaker.Speaker),
+        # Initial state; switch at runtime with id(cam).set_audio_enabled(...)
+        cv.Optional(CONF_ENABLED, default=True): cv.boolean,
+        # Jitter buffer before playback starts; also bounds the audio delay.
+        cv.Optional(CONF_BUFFER_DURATION, default="200ms"): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.Range(min=cv.TimePeriod(milliseconds=60), max=cv.TimePeriod(milliseconds=1000)),
+        ),
+    }
+)
 
 
 def _lvgl_canvas_id(value):
@@ -105,6 +122,7 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_DISPLAY_ID): cv.use_id(display.Display),
             cv.Optional(CONF_LVGL_CANVAS): _lvgl_canvas_id,
+            cv.Optional(CONF_AUDIO): AUDIO_SCHEMA,
             cv.Optional(CONF_LOG_FRAME_INFO, default=True): cv.boolean,
         }
     ).extend(cv.COMPONENT_SCHEMA),
@@ -161,6 +179,16 @@ async def to_code(config):
         # LVGL creates the widget during its own setup, so pass the pointer's address, not its value.
         canvas = await cg.get_variable(config[CONF_LVGL_CANVAS])
         cg.add(var.set_lvgl_canvas(cg.RawExpression(f"&{canvas}")))
+    if audio_config := config.get(CONF_AUDIO):
+        cg.add_define("USE_ESP_RTSP_STREAM_AUDIO")
+        spk = await cg.get_variable(audio_config[CONF_SPEAKER])
+        cg.add(var.set_speaker(spk))
+        cg.add(var.set_audio_enabled(audio_config[CONF_ENABLED]))
+        cg.add(
+            var.set_audio_buffer_ms(
+                audio_config[CONF_BUFFER_DURATION].total_milliseconds
+            )
+        )
 
     if profile["idf_component"] is not None:
         name, ref = profile["idf_component"]
