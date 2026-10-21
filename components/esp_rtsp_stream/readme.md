@@ -36,7 +36,30 @@ The network task runs on core 0 and the decoder on core 1. PSRAM is required.
 
 RTP/JPEG cannot carry frames larger than 2040 px in either direction.
 
+**Picture:** a 640×480 sub-stream at 7–10 fps works well on a 320×240 screen; it is halved exactly to fill it.
+
 ## Configuration
+
+The camera URL lives in a Home Assistant text helper, so switching cameras needs no reflash.
+
+### 1. Home Assistant: text helper
+
+Go to Settings → Devices & services → Helpers → **Create helper → Text**, or use `configuration.yaml`:
+
+```yaml
+input_text:
+  esp_camera_url:
+    name: ESP camera URL
+    max: 255
+    pattern: 'rtsp:\/\/([^:@\/\s]+(:[^@\/\s]*)?@)?((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d):\d{1,5}(\/\S*)?'
+```
+
+Set its value to the camera URL, for example `rtsp://192.168.3.160:554/cam/realmonitor?channel=1&subtype=1`.
+
+- **`max: 255`:** the default of 100 is too short for some URLs.
+- **`pattern`:** the editor only accepts `rtsp://`, an IPv4 address and a port, with an optional `user:pass@` and path. When entering it in the UI (⚙️ → *Regex pattern for client-side validation*), paste it without the quotes. Keep the escaped `\/`: browsers check this field in a regex mode where an unescaped `/` inside `[...]` makes the pattern invalid, and the check then silently stops working. To allow hostnames such as `doorcam.local`, replace the IP part with `[A-Za-z0-9.\-]+`.
+
+### 2. ESPHome
 
 ```yaml
 external_components:
@@ -45,21 +68,91 @@ external_components:
 
 esp_rtsp_stream:
   - id: front_door
-    url: rtsp://192.168.1.64:554/Streaming/Channels/102
-    username: admin                    # or put user:pass@ in the URL
+    username: viewer                   # default login when the URL has none
     password: !secret camera_password
-    output_width: 480                  # optional: fit (keeping aspect) into this box
-    output_height: 320
-    rotation: 0                        # 0/90/180/270, clockwise
-    max_fps: 12                        # optional, default from chip profile
+    lvgl_canvas: cam_canvas            # see "Showing the picture"
+    max_fps: 7                         # optional, default from chip profile
     max_frame_size: 262144             # optional, bytes per JPEG frame
-    display_id: lcd                    # optional: redraw this display on every new frame
     log_frame_info: true               # fps/decode stats every 30 s
+
+text_sensor:
+  - platform: homeassistant
+    id: cam_url
+    entity_id: input_text.esp_camera_url
+    on_value:
+      - lambda: id(front_door).set_url(x);
 ```
 
-Use the `username`/`password` options when the password contains `@`, `/` or `:`.
+All options:
 
-### ESP32-S3 example
+| Option | Default | Meaning |
+|---|---|---|
+| `url` | — | Optional fixed or fallback URL, streamed at boot until Home Assistant sends one |
+| `username` / `password` | — | Login used when the URL has no `user:pass@` |
+| `lvgl_canvas` | — | LVGL canvas to show the picture in |
+| `display_id` | — | Non-LVGL display to redraw on every frame (draw with `id(cam).draw(it)`) |
+| `output_width` / `output_height` | canvas size | Box the picture is fitted into, keeping its shape. Leave unset with `lvgl_canvas`. |
+| `rotation` | 0 | 0/90/180/270, clockwise |
+| `max_fps` | 12 (S3), 25 (P4) | Frames shown per second at most |
+| `max_frame_size` | 256 KB (S3), 1 MB (P4) | Largest JPEG frame accepted |
+| `log_frame_info` | true | Stats line every 30 s |
+
+### Switching cameras
+
+Change the helper's value in Home Assistant and the ESP32 reconnects to the new camera straight away.
+
+- **Valid new URL:** the current session is dropped and the new camera connects.
+- **Same URL re-sent** (e.g. after a Home Assistant reconnect): ignored, so the picture isn't interrupted.
+- **Invalid value** (e.g. `unavailable` while Home Assistant restarts): ignored, and the current camera keeps streaming.
+- **No URL yet:** the component waits.
+- **Until the first frame arrives:** the previous camera's last picture stays on screen.
+
+**Login:** credentials in the URL (`rtsp://user:pass@host:554/...`) take precedence over `username`/`password`. One helper can therefore switch between cameras with different logins, but that password is then visible in Home Assistant. If your cameras share a login, keep credentials out of the URL.
+
+## Showing the picture
+
+### LVGL
+
+```yaml
+lvgl:
+  pages:
+    - id: cam_page
+      widgets:
+        - canvas:
+            id: cam_canvas
+            x: 0
+            y: 0
+            width: 320
+            height: 240
+```
+
+How the picture fits the canvas:
+- **Fit:** the picture is scaled to fit the canvas, keeping its shape, and centred. It is never stretched or cropped.
+- **Black bars:** shown where the shapes differ.
+- **No zoom-in:** the picture is never enlarged beyond its native size.
+
+How it updates:
+- **Copying:** frames are copied into the canvas from the main loop, which is safe for LVGL.
+- **Hidden canvas:** while another page is showing, frames are not decoded. The RTSP session stays connected, so the picture returns instantly.
+
+### Display lambda (without LVGL)
+
+```yaml
+display:
+  - platform: ...            # your panel
+    id: lcd
+    update_interval: never   # esp_rtsp_stream triggers updates
+    auto_clear_enabled: false
+    lambda: |-
+      id(front_door).draw(it);          // centred
+      // id(front_door).draw(it, 0, 0); // or at a position
+```
+
+Add `display_id: lcd` to `esp_rtsp_stream`. With LVGL, use `lvgl_canvas` instead: LVGL owns the screen.
+
+## Board setup
+
+### ESP32-S3
 
 ```yaml
 esp32:
@@ -71,18 +164,9 @@ esp32:
 psram:
   mode: octal
   speed: 80MHz
-
-display:
-  - platform: ...            # your panel
-    id: lcd
-    update_interval: never   # esp_rtsp_stream triggers updates
-    auto_clear_enabled: false
-    lambda: |-
-      id(front_door).draw(it);          // centred
-      // id(front_door).draw(it, 0, 0); // or at a position
 ```
 
-### ESP32-P4 example
+### ESP32-P4
 
 ```yaml
 esp32:
@@ -96,131 +180,35 @@ psram:
 # Network: ethernet (best for high resolution) or esp32_hosted + wifi
 ```
 
-The display section is the same as for the S3, typically with a `mipi_dsi` panel. For a portrait 800×1280 panel showing a landscape camera, use `rotation: 90` and `output_width: 800` / `output_height: 1280`.
+For a portrait 800×1280 panel showing a landscape camera, use `rotation: 90`.
 
-## Audio
+## Cameras without MJPEG (go2rtc / Frigate)
 
-The camera's audio track is played on an ESPHome `speaker`. It arrives on the same RTSP connection as the video.
-
-```yaml
-esp_rtsp_stream:
-  - id: front_door
-    # ...
-    audio:
-      speaker: cam_speaker      # required
-      enabled: true             # initial state; change it with id(front_door).set_audio_enabled(...)
-      buffer_duration: 200ms    # jitter buffer, 60ms-1s
-```
-
-**Supported codecs:** G.711 µ-law (PCMU), G.711 A-law (PCMA) and L16, at any sample rate the camera announces (8 kHz or 16 kHz). AAC, G.726 and Opus are not supported; the log says so if the camera sends one.
-
-| Camera | Setting |
-|---|---|
-| Hikvision | Video/Audio → Video → sub-stream *Stream Type: Video & Audio*; Video/Audio → Audio → *Audio Encoding: G.711ulaw* |
-| Dahua | Camera → Audio → enable audio on the sub-stream, *Encode Mode: G.711A* (or G.711Mu) |
-
-**When audio plays:** only while the picture does. It stops while the `lvgl_canvas` page is hidden, while the stream is down, or when disabled. If audio and video clocks drift apart, the buffer skips ahead so the delay stays under ~3× `buffer_duration`.
-
-**Sharing the speaker:** the camera runs at 8 or 16 kHz, while the S3-Box speaker runs at 48 kHz and is also used by the media player. Put a `resampler` in front of a `mixer` input so both can play:
-
-```yaml
-speaker:
-  - platform: i2s_audio
-    id: box_speaker
-    # ... unchanged
-  - platform: mixer
-    id: mixing_speaker
-    output_speaker: box_speaker
-    source_speakers:
-      - id: media_mixing_input
-      - id: cam_mixing_input
-  - platform: resampler
-    id: cam_speaker               # esp_rtsp_stream -> audio -> speaker
-    output_speaker: cam_mixing_input
-
-media_player:
-  - platform: speaker
-    # ...
-    announcement_pipeline:
-      speaker: media_mixing_input   # was box_speaker
-      format: FLAC
-      sample_rate: 48000
-      num_channels: 1
-```
-
-**Using go2rtc / Frigate instead:** the ESP32 can't transcode, so it can't use the `#audio=opus` stream directly. go2rtc can transcode for it, and the component can read go2rtc's RTSP restream instead of the camera:
+The ESP32 can't decode H.264. go2rtc can convert a stream to MJPEG for it:
 
 ```yaml
 go2rtc:
   streams:
     porch_esp:
-      - "ffmpeg:PorchDahuaFrigate#video=mjpeg#audio=pcmu"
+      - "ffmpeg:PorchDahuaFrigate#video=mjpeg"
 ```
 
-Then use `url: rtsp://FRIGATE_IP:8554/porch_esp`. This also lets the ESP32 show a main-stream (H.264) camera, at the cost of transcoding on the server.
-
-## Changing the camera at runtime
-
-`url` is optional. The URL can come from Home Assistant instead, so switching cameras needs no reflash:
-
-```yaml
-esp_rtsp_stream:
-  - id: front_door
-    username: viewer                   # default login when the URL has none
-    password: !secret camera_password
-    lvgl_canvas: cam_canvas
-
-text_sensor:
-  - platform: homeassistant
-    id: cam_url
-    entity_id: input_text.esp_camera_url
-    on_value:
-      - lambda: id(front_door).set_url(x);
-```
-
-What happens on `set_url()`:
-- **Valid new URL:** the component drops the current session and connects to the new camera straight away.
-- **Same URL again:** ignored, so a Home Assistant reconnect doesn't interrupt the picture.
-- **Invalid value** (e.g. `unavailable` while Home Assistant restarts): ignored, and the current camera keeps streaming.
-- **No URL yet** (none in YAML, Home Assistant not connected): the component waits.
-
-**Login:** credentials in the URL (`rtsp://user:pass@host/...`) take precedence over `username`/`password`. One `input_text` can therefore switch between cameras with different logins. Note that the password is then visible in Home Assistant.
-
-`set_credentials(user, pass)` is also available at runtime.
+Then set the helper to `rtsp://FRIGATE_IP:8554/porch_esp`. The conversion runs on the server.
 
 ## C++ API
 
 - `set_url(url)`, `set_credentials(user, pass)`: switch camera at runtime.
-- `draw(it)` / `draw(it, x, y)`: draw the newest frame.
+- `draw(it)` / `draw(it, x, y)`: draw the newest frame (display lambda).
 - `has_frame()`, `is_streaming()`, `get_frame_width()`, `get_frame_height()`
 - `get_frame_count()`, `get_dropped_frames()`, `get_last_decode_ms()`
-- `set_audio_enabled(bool)`, `is_audio_enabled()`
 
 ## Limitations
 
-- MJPEG only; no H.264/H.265.
+- MJPEG only; no H.264/H.265, and no audio.
 - RTP over TCP only. A camera that refuses TCP transport fails at SETUP.
 - 8-bit quantisation tables only; 16-bit tables are rare.
-- With LVGL, use `lvgl_canvas` (below), not a display lambda: LVGL owns the screen.
 
-## LVGL
+## Tested Board-screen
 
-```yaml
-esp_rtsp_stream:
-  - id: front_door
-    url: rtsp://192.168.1.64:554/Streaming/Channels/102
-    lvgl_canvas: cam_canvas   # output size defaults to the canvas size
-
-lvgl:
-  pages:
-    - id: cam_page
-      widgets:
-        - canvas:
-            id: cam_canvas
-            x: 0
-            y: 0
-            width: 320
-            height: 240
-```
-
-The frame is copied into the canvas from the main loop, which is safe for LVGL, and centred on it. While the canvas isn't on screen (another page is showing), frames are not decoded. The RTSP session stays connected, so the picture comes back instantly.
+- ESP32-S3 Box3 - 2.4-inch color TFT SPI 320x240
+- 
