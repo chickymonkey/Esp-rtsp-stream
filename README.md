@@ -91,6 +91,7 @@ All options:
 | `url` | — | Optional fixed or fallback URL, streamed at boot until Home Assistant sends one |
 | `username` / `password` | — | Login used when the URL has no `user:pass@` |
 | `lvgl_canvas` | — | LVGL canvas to show the picture in |
+| `hidden_timeout` | 3s | With `lvgl_canvas`: disconnect from the camera once the canvas has been hidden this long. `never` keeps the session open. |
 | `display_id` | — | Non-LVGL display to redraw on every frame (draw with `id(cam).draw(it)`) |
 | `output_width` / `output_height` | canvas size | Box the picture is fitted into, keeping its shape. Leave unset with `lvgl_canvas`. |
 | `rotation` | 0 | 0/90/180/270, clockwise |
@@ -135,7 +136,10 @@ How the picture fits the canvas:
 
 How it updates:
 - **Copying:** frames are copied into the canvas from the main loop, which is safe for LVGL.
-- **Hidden canvas:** while another page is showing, frames are not decoded. The RTSP session stays connected, so the picture returns instantly.
+- **Hidden canvas:** while another page is showing, frames are not decoded.
+- **Disconnect when away:** once the canvas has been hidden for `hidden_timeout` (default 3 s), the ESP32 sends TEARDOWN and closes the RTSP session. That frees the camera's session slot, WiFi bandwidth and CPU. A quick page flick shorter than that keeps the session.
+- **Coming back:** the stream reconnects as soon as the canvas shows again. The last picture stays on screen until the first new frame, usually within a second or two.
+- **Always connected:** set `hidden_timeout: never` to keep the session open, so the picture returns instantly.
 
 ### Display lambda (without LVGL)
 
@@ -491,6 +495,6 @@ How it behaves:
 
 - `set_url(url)`, `set_credentials(user, pass)`: switch camera at runtime.
 - `draw(it)` / `draw(it, x, y)`: draw the newest frame (display lambda).
-- `has_frame()`, `is_streaming()`, `get_frame_width()`, `get_frame_height()`
+- `has_frame()`, `is_streaming()`, `is_paused()`, `get_frame_width()`, `get_frame_height()`
 - `get_frame_count()`, `get_dropped_frames()`, `get_last_decode_ms()`
 - `set_audio_muted(bool)`, `is_audio_muted()`, `is_audio_playing()`: camera audio control
