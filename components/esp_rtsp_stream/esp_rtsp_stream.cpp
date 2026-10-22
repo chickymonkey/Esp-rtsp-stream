@@ -674,7 +674,13 @@ void RtspMjpeg::decode_loop_() {
 #endif
 
   while (true) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0) {
+      // No frame pending. A paused stream hands its frame buffers back, so several streams (e.g. small tiles
+      // and a full-size page of the same cameras) only need PSRAM for the ones on screen.
+      if (!this->connection_wanted_)
+        this->release_frame_buffers_();
+      continue;
+    }
     const uint32_t start = millis();
     const bool ok = this->decode_frame_(this->jpeg_buffers_[this->ready_index_], this->ready_len_, this->ready_width_,
                                         this->ready_height_);
@@ -794,6 +800,36 @@ uint8_t *RtspMjpeg::alloc_jpeg_buffer_(size_t bytes) {
 
 void RtspMjpeg::free_buffer_(uint8_t *buf) { heap_caps_free(buf); }
 
+void RtspMjpeg::release_frame_buffers_() {
+  // Decode task only, so no decode is using them; frame_mutex_ keeps the canvas copy out.
+  std::lock_guard<std::mutex> lock(this->frame_mutex_);
+  bool freed = false;
+  auto release = [&](uint8_t *&buf, size_t &capacity) {
+    if (buf == nullptr)
+      return;
+    this->free_buffer_(buf);
+    buf = nullptr;
+    capacity = 0;
+    freed = true;
+  };
+  release(this->rgb_[0], this->rgb_capacity_[0]);
+  release(this->rgb_[1], this->rgb_capacity_[1]);
+  release(this->scaled_, this->scaled_capacity_);
+#ifdef USE_ESP_RTSP_STREAM_HW_JPEG
+  release(this->staging_, this->staging_capacity_);
+#endif
+  if (!freed)
+    return;
+  this->front_width_ = 0;
+  this->front_height_ = 0;
+  this->new_frame_ = false;
+#ifdef USE_LVGL
+  this->canvas_frame_width_ = 0;  // clear the canvas borders again on the next frame
+  this->canvas_frame_height_ = 0;
+#endif
+  ESP_LOGD(TAG, "Stream paused: frame buffers freed");
+}
+
 bool RtspMjpeg::ensure_buffer_(uint8_t *&buf, size_t &capacity, size_t bytes) {
   if (capacity >= bytes)
     return true;
@@ -811,7 +847,14 @@ bool RtspMjpeg::ensure_buffer_(uint8_t *&buf, size_t &capacity, size_t bytes) {
   buf = static_cast<uint8_t *>(heap_caps_aligned_calloc(16, 1, bytes, MALLOC_CAP_SPIRAM));
 #endif
   if (buf == nullptr) {
-    ESP_LOGE(TAG, "Cannot allocate a %u byte frame buffer", (unsigned) bytes);
+    // Retried on every frame, so log at most every 5 s.
+    const uint32_t now = millis();
+    if (now - this->last_alloc_error_ms_ >= 5000) {
+      this->last_alloc_error_ms_ = now;
+      ESP_LOGE(TAG, "Cannot allocate a %u byte frame buffer (PSRAM free %u, largest block %u)", (unsigned) bytes,
+               (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+               (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    }
     return false;
   }
   capacity = allocated;

@@ -139,6 +139,8 @@ class RtspMjpeg : public Component {
 #endif
   uint8_t *alloc_jpeg_buffer_(size_t bytes);
   void free_buffer_(uint8_t *buf);
+  /// Frees the decode/frame buffers while the stream is paused. Decode task only.
+  void release_frame_buffers_();
 
   // Configuration
   // Written by set_url()/set_credentials() on the main loop, read by the network task.
@@ -250,6 +252,7 @@ class RtspMjpeg : public Component {
   uint32_t last_stats_ms_{0};
   uint32_t last_stats_decoded_{0};
   uint32_t last_warning_ms_{0};
+  uint32_t last_alloc_error_ms_{0};
 };
 
 }  // namespace esp_rtsp_stream
