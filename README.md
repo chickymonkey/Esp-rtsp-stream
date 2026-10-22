@@ -23,7 +23,7 @@ The profile is chosen automatically from the `esp32:` variant/board, so you don'
 | Default `max_fps` | 12 | 25 |
 | Default `max_frame_size` | 256 KB | 1 MB |
 | Recommended stream | 640×480 or 704×576 (D1), MJPEG | Up to 1920×1080 MJPEG, link permitting |
-| Expected rate | ~15–20 fps at D1/VGA, if WiFi keeps up | Limited by the network, not the decoder |
+| Expected rate | ~15–20 fps at D1/VGA on an otherwise idle board, if WiFi keeps up. About 5–6 fps measured on a busy BOX-3; see [Tuning](#tuning). | Limited by the network, not the decoder |
 | lwIP TCP window | 32 KB | 64 KB |
 
 The network task runs on core 0 and the decoder on core 1. PSRAM is required.
@@ -478,6 +478,44 @@ How it behaves:
 - **In sync:** the button and the Home Assistant switch always agree, because both drive the same switch.
 - **Overlays:** anything on LVGL's `top_layer`, such as a voice assistant notice bar, is drawn above the button and can cover it.
 
+## Reading the log
+
+With `log_frame_info: true`, the component logs each step of a session and a stats line every 30 s. This log is from an ESP32-S3-BOX-3 showing a Dahua 640×480 MJPEG sub-stream with G.711A audio:
+
+```
+[I][esp_rtsp_stream]: Canvas shown: resuming the camera stream
+[I][esp_rtsp_stream]: Audio track: G.711 A-law, 8000 Hz, 1 channel(s) -> speaker at 48000 Hz
+[I][esp_rtsp_stream]: Streaming MJPEG with audio from 192.168.3.160
+[I][esp_rtsp_stream]: First frame: 640x480 stream -> 300x225 output, decoded in 102 ms
+[I][esp_rtsp_stream]: 640x480 stream -> 300x225, 5.6 fps shown, decode 86 ms, 214 dropped, 0 corrupt
+[I][esp_rtsp_stream]: Audio G.711 A-law 8000 Hz -> 48000 Hz: muted, 1535 packets, 0 samples dropped
+[I][esp_rtsp_stream]: Canvas hidden: pausing the camera stream
+```
+
+| Line | Meaning |
+|---|---|
+| `Canvas shown` / `Canvas hidden` | The stream resumed or paused because the LVGL page changed. See `hidden_timeout`. |
+| `Audio track` | The camera's audio codec and rate, and the rate it is converted to. Missing if there is no `audio:` block or the camera has no audio. |
+| `Streaming MJPEG` | PLAY succeeded. `with audio` means the audio track was set up too. |
+| `First frame` | Camera size, output size and the time to decode the first frame. |
+| `fps shown` | Frames drawn per second since the previous stats line. |
+| `decode` | Time to decode and scale the latest frame. |
+| `dropped` | Frames skipped since boot, because they arrived faster than `max_fps` or while the decoder was busy. Normal; it keeps the picture current. |
+| `corrupt` | Frames lost to missing packets or bad JPEG data. Should stay at or near 0. |
+| `muted` / `playing` / `paused` | Audio state: muted by `set_audio_muted()`, sent to the speaker, or stopped because the canvas is hidden. |
+| `samples dropped` | Audio the speaker had no room for. Only counted while playing; a slowly rising number means the camera's clock runs slightly fast. |
+
+Things that look wrong but aren't:
+- **Low fps on the first stats line after a page change:** fps is averaged over the whole 30 s window, including the time the stream was paused.
+- **A large `dropped` count:** it is a total since boot, and dropping is how the picture stays current.
+
+### Tuning
+
+- **Match the camera to `max_fps`:** every dropped frame still crossed the WiFi. Set the camera's sub-stream frame rate close to `max_fps` to save bandwidth with no visible change.
+- **Decode time limits the frame rate:** the most frames per second is about 1000 divided by the `decode` time in ms. At 86 ms that is about 11 fps, and in practice less, because the network and the screen also need time.
+- **Smaller pictures decode faster:** on the ESP32-S3 the decoder always decodes the full camera picture before scaling it. A 352×288 sub-stream decodes much faster than 640×480, and on a 320×240 screen it looks almost the same.
+- **Busy boards are slower:** a voice assistant, wake word, media player and a busy LVGL UI all share the CPU and PSRAM. On the BOX-3 below, with all of them running, 640×480 decoded in about 86 ms.
+
 ## Limitations
 
 - MJPEG only; no H.264/H.265.
@@ -489,7 +527,7 @@ How it behaves:
 
 ## Tested Board-screen
 
-- ESP32-S3 Box3 - 2.4-inch color TFT SPI 320x240
+- **ESP32-S3-BOX-3**, 2.4-inch 320×240 SPI TFT. Dahua 640×480 MJPEG sub-stream with G.711A audio, LVGL canvas 300×225, with voice assistant, micro wake word and media player running: about 5.6 fps, 86 ms decode, 0 corrupt frames.
   
 ## C++ API
 
