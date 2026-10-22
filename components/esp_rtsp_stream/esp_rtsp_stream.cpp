@@ -121,6 +121,21 @@ void RtspMjpeg::loop() {
       this->box_height_ = lv_obj_get_height(canvas);
     }
     this->frames_wanted_ = visible;
+    const uint32_t now_ms = millis();
+    if (visible) {
+      this->last_visible_ms_ = now_ms;
+      if (!this->connection_wanted_) {
+        ESP_LOGI(TAG, "Canvas shown: resuming the camera stream");
+        this->connection_wanted_ = true;
+        if (this->network_task_handle_ != nullptr)
+          xTaskNotifyGive(this->network_task_handle_);  // wake the paused network task
+      }
+    } else if (this->connection_wanted_ && this->hidden_timeout_ms_ != UINT32_MAX &&
+               now_ms - this->last_visible_ms_ >= this->hidden_timeout_ms_) {
+      // Short page flicks keep the session; a longer absence frees the camera, WiFi and CPU.
+      ESP_LOGI(TAG, "Canvas hidden: pausing the camera stream");
+      this->connection_wanted_ = false;
+    }
     if (visible && new_frame)
       this->update_lvgl_canvas_(canvas);
   }
@@ -170,6 +185,14 @@ void RtspMjpeg::dump_config() {
   ESP_LOGCONFIG(TAG, "  Rotation: %d", this->rotation_);
   ESP_LOGCONFIG(TAG, "  Max frame size: %u bytes", (unsigned) this->max_frame_size_);
   ESP_LOGCONFIG(TAG, "  Tasks: network on core %d, decode on core %d", this->network_core_, this->decode_core_);
+#ifdef USE_LVGL
+  if (this->lvgl_canvas_ != nullptr) {
+    if (this->hidden_timeout_ms_ == UINT32_MAX)
+      ESP_LOGCONFIG(TAG, "  While hidden: stay connected");
+    else
+      ESP_LOGCONFIG(TAG, "  While hidden: disconnect after %u ms", (unsigned) this->hidden_timeout_ms_);
+  }
+#endif
 #ifdef USE_ESP_RTSP_STREAM_AUDIO
   if (this->speaker_ != nullptr) {
     ESP_LOGCONFIG(TAG, "  Audio: speaker at %u Hz, %s", (unsigned) this->audio_sample_rate_,
@@ -249,6 +272,12 @@ void RtspMjpeg::network_loop_() {
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
       continue;
     }
+    if (!this->connection_wanted_) {
+      // Canvas hidden: stay disconnected until loop() or set_url() wakes us.
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+      backoff_ms = 1000;
+      continue;
+    }
     if (!network::is_connected()) {
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
       continue;
@@ -262,6 +291,9 @@ void RtspMjpeg::network_loop_() {
       ESP_LOGI(TAG, "Camera URL changed, switching");
       continue;
     }
+    if (!this->connection_wanted_)
+      continue;  // paused on purpose, not a failure: no backoff
+
     backoff_ms = got_frames ? 1000 : std::min<uint32_t>(backoff_ms * 2, 30000);
     ESP_LOGW(TAG, "Stream stopped, reconnecting in %u s", (unsigned) (backoff_ms / 1000));
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(backoff_ms));
@@ -395,8 +427,12 @@ bool RtspMjpeg::run_session_() {
   uint32_t last_keepalive_ms = millis();
   size_t garbage = 0;
   while (true) {
-    if (this->config_changed_)
-      break;  // new camera URL: drop this session
+    if (this->config_changed_ || !this->connection_wanted_) {
+      // New camera URL, or the canvas is hidden. TEARDOWN frees the camera's session slot straight away
+      // instead of leaving it open until its timeout; cameras allow only a few RTSP sessions.
+      this->conn_.send_only("TEARDOWN", play_uri, "");
+      break;
+    }
     if (millis() - last_keepalive_ms > keepalive_ms) {
       if (!this->conn_.send_only("OPTIONS", url.uri, ""))
         break;

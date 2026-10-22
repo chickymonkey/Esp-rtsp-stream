@@ -29,6 +29,7 @@ CONF_OUTPUT_HEIGHT = "output_height"
 CONF_MAX_FRAME_SIZE = "max_frame_size"
 CONF_LOG_FRAME_INFO = "log_frame_info"
 CONF_LVGL_CANVAS = "lvgl_canvas"
+CONF_HIDDEN_TIMEOUT = "hidden_timeout"
 CONF_AUDIO = "audio"
 CONF_SPEAKER = "speaker"
 CONF_SAMPLE_RATE = "sample_rate"
@@ -119,6 +120,10 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_DISPLAY_ID): cv.use_id(display.Display),
             cv.Optional(CONF_LVGL_CANVAS): _lvgl_canvas_id,
+            # Disconnect once the canvas has been hidden this long; "never" keeps the session open.
+            cv.Optional(CONF_HIDDEN_TIMEOUT, default="3s"): cv.Any(
+                cv.one_of("never", lower=True), cv.positive_time_period_milliseconds
+            ),
             cv.Optional(CONF_LOG_FRAME_INFO, default=True): cv.boolean,
             cv.Optional(CONF_AUDIO): AUDIO_SCHEMA,
         }
@@ -177,6 +182,12 @@ async def to_code(config):
         # LVGL creates the widget during its own setup, so pass the pointer's address, not its value.
         canvas = await cg.get_variable(config[CONF_LVGL_CANVAS])
         cg.add(var.set_lvgl_canvas(cg.RawExpression(f"&{canvas}")))
+        timeout = config[CONF_HIDDEN_TIMEOUT]
+        cg.add(
+            var.set_hidden_timeout(
+                0xFFFFFFFF if timeout == "never" else timeout.total_milliseconds
+            )
+        )
 
     if profile["idf_component"] is not None:
         name, ref = profile["idf_component"]

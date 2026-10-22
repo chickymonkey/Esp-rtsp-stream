@@ -57,6 +57,8 @@ class RtspMjpeg : public Component {
     this->decode_core_ = decode_core;
   }
   void set_log_frame_info(bool enabled) { this->log_frame_info_ = enabled; }
+  /// With lvgl_canvas: disconnect from the camera once the canvas has been hidden this long. UINT32_MAX = never.
+  void set_hidden_timeout(uint32_t ms) { this->hidden_timeout_ms_ = ms; }
 #ifdef USE_ESP_RTSP_STREAM_AUDIO
   /// Plays the camera's audio track on this speaker.
   void set_speaker(speaker::Speaker *speaker) { this->speaker_ = speaker; }
@@ -88,6 +90,8 @@ class RtspMjpeg : public Component {
 
   bool has_frame() const { return this->front_width_ > 0; }
   bool is_streaming() const { return this->streaming_; }
+  /// True while the stream is disconnected because the canvas is hidden.
+  bool is_paused() const { return !this->connection_wanted_; }
   int get_frame_width() const { return this->front_width_; }
   int get_frame_height() const { return this->front_height_; }
   uint32_t get_frame_count() const { return this->decoded_frames_; }
@@ -161,6 +165,10 @@ class RtspMjpeg : public Component {
 #endif
   // False while nothing shows the stream (e.g. the canvas page is hidden): frames are not decoded.
   std::atomic<bool> frames_wanted_{true};
+  // False once the canvas has been hidden for hidden_timeout_ms_: the network task disconnects.
+  std::atomic<bool> connection_wanted_{true};
+  uint32_t hidden_timeout_ms_{3000};
+  uint32_t last_visible_ms_{0};
 
   RtspUrl parsed_url_;
   RtspConnection conn_;
