@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <strings.h>
@@ -21,6 +22,8 @@ namespace esphome {
 namespace esp_rtsp_stream {
 
 static const char *const TAG = "esp_rtsp_stream";
+// Larger interleaved audio packets are skipped; G.711 cameras send 160-1024 bytes.
+static const size_t AUDIO_MAX_PACKET = 4096;
 
 #ifdef USE_ESP_RTSP_STREAM_HW_JPEG
 static const char *const DECODER_NAME = "ESP32-P4 hardware JPEG + PPA scaler";
@@ -72,6 +75,24 @@ void RtspMjpeg::setup() {
     }
   }
 
+#ifdef USE_ESP_RTSP_STREAM_AUDIO
+  if (this->speaker_ != nullptr) {
+    // Room for one packet of 8 kHz G.711, the densest supported input, at the output rate.
+    this->audio_pcm_capacity_ = AUDIO_MAX_PACKET * this->audio_sample_rate_ / 8000 + 2;
+    this->audio_packet_ = static_cast<uint8_t *>(heap_caps_malloc(AUDIO_MAX_PACKET, MALLOC_CAP_8BIT));
+    this->audio_pcm_ = static_cast<int16_t *>(
+        heap_caps_malloc(this->audio_pcm_capacity_ * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (this->audio_packet_ == nullptr || this->audio_pcm_ == nullptr) {
+      ESP_LOGE(TAG, "Cannot allocate audio buffers; audio disabled");
+      heap_caps_free(this->audio_packet_);
+      heap_caps_free(this->audio_pcm_);
+      this->audio_packet_ = nullptr;
+      this->audio_pcm_ = nullptr;
+      this->speaker_ = nullptr;
+    }
+  }
+#endif
+
   if (xTaskCreatePinnedToCore(decode_task_, "rtsp_dec", 8192, this, 1, &this->decode_task_handle_,
                               this->decode_core_) != pdPASS ||
       xTaskCreatePinnedToCore(network_task_, "rtsp_net", 8192, this, 5, &this->network_task_handle_,
@@ -104,6 +125,7 @@ void RtspMjpeg::loop() {
       this->update_lvgl_canvas_(canvas);
   }
 #endif
+  this->update_audio_();
 
   const uint32_t now = millis();
   if (this->log_frame_info_ && now - this->last_stats_ms_ >= 30000) {
@@ -114,6 +136,13 @@ void RtspMjpeg::loop() {
                this->stream_height_, this->front_width_, this->front_height_, fps,
                (unsigned) this->last_decode_ms_.load(), (unsigned) this->dropped_frames_.load(),
                (unsigned) this->corrupt_frames_.load());
+      if (this->audio_track_active_) {
+        ESP_LOGI(TAG, "Audio %s %u Hz -> %u Hz: %s, %u packets, %u samples dropped",
+                 this->audio_decoder_.codec_name(), (unsigned) this->audio_decoder_.input_rate(),
+                 (unsigned) this->audio_sample_rate_,
+                 this->audio_wanted_ ? "playing" : (this->audio_muted_ ? "muted" : "paused"),
+                 (unsigned) this->audio_packets_.load(), (unsigned) this->audio_dropped_samples_.load());
+      }
     }
     this->last_stats_ms_ = now;
     this->last_stats_decoded_ = decoded;
@@ -141,6 +170,41 @@ void RtspMjpeg::dump_config() {
   ESP_LOGCONFIG(TAG, "  Rotation: %d", this->rotation_);
   ESP_LOGCONFIG(TAG, "  Max frame size: %u bytes", (unsigned) this->max_frame_size_);
   ESP_LOGCONFIG(TAG, "  Tasks: network on core %d, decode on core %d", this->network_core_, this->decode_core_);
+#ifdef USE_ESP_RTSP_STREAM_AUDIO
+  if (this->speaker_ != nullptr) {
+    ESP_LOGCONFIG(TAG, "  Audio: speaker at %u Hz, %s", (unsigned) this->audio_sample_rate_,
+                  this->audio_muted_ ? "muted" : "unmuted");
+  } else
+#endif
+  {
+    ESP_LOGCONFIG(TAG, "  Audio: off");
+  }
+}
+
+void RtspMjpeg::update_audio_() {
+#ifdef USE_ESP_RTSP_STREAM_AUDIO
+  if (this->speaker_ == nullptr)
+    return;
+  // Audio follows the picture: nothing plays while the canvas page is hidden.
+  const bool want = this->audio_track_active_ && !this->audio_muted_ && this->frames_wanted_;
+  if (want && !this->speaker_started_) {
+    this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, this->audio_sample_rate_));
+    this->speaker_->start();
+    this->speaker_started_ = true;
+    this->audio_wanted_ = true;
+    this->last_audio_start_ms_ = millis();
+  } else if (!want && this->speaker_started_) {
+    this->audio_wanted_ = false;  // stop the network task feeding it first
+    this->speaker_->stop();
+    this->speaker_started_ = false;
+  } else if (want && this->speaker_->is_stopped() && millis() - this->last_audio_start_ms_ > 1000) {
+    // Something else stopped the speaker: a mixer source speaker's idle timeout after a WiFi gap,
+    // or another component sharing it. Start it again, at most once a second.
+    this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, this->audio_sample_rate_));
+    this->speaker_->start();
+    this->last_audio_start_ms_ = millis();
+  }
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -167,6 +231,7 @@ bool RtspMjpeg::apply_config_() {
   }
   this->parsed_url_ = parsed;
   this->conn_.set_credentials(parsed.username, parsed.password);
+  this->audio_unsupported_logged_ = false;  // warn again about the new camera
   ESP_LOGI(TAG, "Camera: %s", parsed.uri.c_str());
   return true;
 }
@@ -192,6 +257,7 @@ void RtspMjpeg::network_loop_() {
     this->conn_.close();
     this->assembler_.abandon();
     this->streaming_ = false;
+    this->audio_track_active_ = false;
     if (this->config_changed_) {
       ESP_LOGI(TAG, "Camera URL changed, switching");
       continue;
@@ -234,6 +300,30 @@ bool RtspMjpeg::run_session_() {
   }
   this->video_payload_type_ = track.payload_type;
 
+  // Audio is optional: any problem with it leaves a video-only session.
+  this->audio_track_active_ = false;
+  this->audio_channel_ = 255;
+  SdpAudioTrack audio;
+  bool setup_audio = false;
+#ifdef USE_ESP_RTSP_STREAM_AUDIO
+  if (this->speaker_ != nullptr) {
+    if (!parse_sdp_audio(resp.body, audio)) {
+      if (!this->audio_unsupported_logged_)
+        ESP_LOGW(TAG, "Camera offers no audio track; enable audio on this camera stream");
+      this->audio_unsupported_logged_ = true;
+    } else if (!this->audio_decoder_.configure(audio.encoding, audio.clock_rate, audio.channels,
+                                               this->audio_sample_rate_)) {
+      if (!this->audio_unsupported_logged_)
+        ESP_LOGW(TAG, "Camera audio is %s, which is not supported. Use G.711 (PCMA/PCMU) or L16; see README",
+                 audio.encoding.empty() ? "an unknown codec" : audio.encoding.c_str());
+      this->audio_unsupported_logged_ = true;
+    } else {
+      setup_audio = true;
+      this->audio_payload_type_ = audio.payload_type;
+    }
+  }
+#endif
+
   std::string base = resp.header("Content-Base");
   if (base.empty())
     base = resp.header("Content-Location");
@@ -263,6 +353,29 @@ bool RtspMjpeg::run_session_() {
   this->rtp_channel_ = interleaved == std::string::npos ? 0 : atoi(transport.c_str() + interleaved + 12);
   this->conn_.set_session(session);
 
+  if (setup_audio) {
+    const std::string audio_uri = resolve_control_url(base, audio.control);
+    const uint8_t want_channel = this->rtp_channel_ == 2 ? 4 : 2;
+    char audio_transport[64];
+    snprintf(audio_transport, sizeof(audio_transport), "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u\r\n",
+             (unsigned) want_channel, (unsigned) (want_channel + 1));
+    if (!this->conn_.request("SETUP", audio_uri, audio_transport, resp))
+      return false;
+    if (resp.status == 200) {
+      const std::string audio_tr = resp.header("Transport");
+      const size_t pos = audio_tr.find("interleaved=");
+      this->audio_channel_ = pos == std::string::npos ? want_channel : atoi(audio_tr.c_str() + pos + 12);
+      this->audio_decoder_.reset();
+      this->audio_packets_ = 0;
+      this->audio_dropped_samples_ = 0;
+      ESP_LOGI(TAG, "Audio track: %s, %u Hz, %d channel(s) -> speaker at %u Hz",
+               this->audio_decoder_.codec_name(), (unsigned) this->audio_decoder_.input_rate(),
+               this->audio_decoder_.input_channels(), (unsigned) this->audio_sample_rate_);
+    } else {
+      ESP_LOGW(TAG, "Audio SETUP failed with %d; continuing with video only", resp.status);
+    }
+  }
+
   if (!this->conn_.request("PLAY", play_uri, "Range: npt=0.000-\r\n", resp))
     return false;
   if (resp.status != 200) {
@@ -270,7 +383,8 @@ bool RtspMjpeg::run_session_() {
     return false;
   }
 
-  ESP_LOGI(TAG, "Streaming MJPEG from %s", url.host.c_str());
+  ESP_LOGI(TAG, "Streaming MJPEG%s from %s", this->audio_channel_ != 255 ? " with audio" : "", url.host.c_str());
+  this->audio_track_active_ = this->audio_channel_ != 255;
   this->streaming_ = true;
   this->have_seq_ = false;
   this->session_frames_ = 0;
@@ -297,7 +411,13 @@ bool RtspMjpeg::run_session_() {
       if (!this->conn_.read_exact(hdr, sizeof(hdr)))
         break;
       const uint16_t len = (hdr[1] << 8) | hdr[2];
-      const bool ok = hdr[0] == this->rtp_channel_ ? this->handle_rtp_(len) : this->conn_.skip(len);
+      bool ok;
+      if (hdr[0] == this->rtp_channel_)
+        ok = this->handle_rtp_(len);
+      else if (hdr[0] == this->audio_channel_)
+        ok = this->handle_audio_rtp_(len);
+      else
+        ok = this->conn_.skip(len);  // RTCP and anything else
       if (!ok)
         break;
       garbage = 0;
@@ -426,6 +546,45 @@ bool RtspMjpeg::handle_rtp_(uint16_t len) {
     if (jpeg_len > 0)
       this->frame_complete_(jpeg_len);
   }
+  return true;
+}
+
+bool RtspMjpeg::handle_audio_rtp_(uint16_t len) {
+  if (this->audio_packet_ == nullptr || len < 12 || len > AUDIO_MAX_PACKET)
+    return this->conn_.skip(len);
+  if (!this->conn_.read_exact(this->audio_packet_, len))
+    return false;
+#ifdef USE_ESP_RTSP_STREAM_AUDIO
+  this->audio_packets_++;
+  // Muted, page hidden, or the speaker is still starting: drop the packet so no backlog builds up.
+  if (!this->audio_wanted_ || this->speaker_ == nullptr || !this->speaker_->is_running())
+    return true;
+
+  const uint8_t *p = this->audio_packet_;
+  if ((p[1] & 0x7F) != this->audio_payload_type_)
+    return true;
+  size_t used = 12 + (p[0] & 0x0F) * 4;  // fixed header + CSRCs
+  if (p[0] & 0x10) {
+    if (used + 4 > len)
+      return true;
+    used += 4 + ((p[used + 2] << 8) | p[used + 3]) * 4;
+  }
+  size_t end = len;
+  if (p[0] & 0x20)
+    end -= std::min<size_t>(p[len - 1], end);
+  if (used >= end)
+    return true;
+
+  const size_t samples = this->audio_decoder_.decode(p + used, end - used, this->audio_pcm_, this->audio_pcm_capacity_);
+  const auto *pcm = reinterpret_cast<const uint8_t *>(this->audio_pcm_);
+  const size_t bytes = samples * sizeof(int16_t);
+  // Never block here: the speaker's own buffer is the jitter buffer, and video shares this task.
+  size_t written = this->speaker_->play(pcm, bytes, 0);
+  if (written & 1)  // never leave half a sample behind, or every later sample would be misaligned
+    written += this->speaker_->play(pcm + written, 1, pdMS_TO_TICKS(20));
+  if (written < bytes)
+    this->audio_dropped_samples_ += (bytes - written) / sizeof(int16_t);
+#endif
   return true;
 }
 

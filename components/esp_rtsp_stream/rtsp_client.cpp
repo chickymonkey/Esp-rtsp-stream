@@ -222,6 +222,79 @@ bool parse_sdp_video(const std::string &sdp, SdpVideoTrack &out) {
   return found;
 }
 
+bool parse_sdp_audio(const std::string &sdp, SdpAudioTrack &out) {
+  bool in_audio = false;
+  bool found = false;
+  size_t pos = 0;
+  while (pos < sdp.size()) {
+    size_t eol = sdp.find('\n', pos);
+    if (eol == std::string::npos)
+      eol = sdp.size();
+    const std::string line = trim(sdp.substr(pos, eol - pos));
+    pos = eol + 1;
+
+    if (line.rfind("m=", 0) == 0) {
+      in_audio = false;
+      if (found)
+        continue;  // only the first audio track is used
+      if (line.rfind("m=audio ", 0) == 0) {
+        in_audio = true;
+        found = true;
+        // m=audio <port> <proto> <fmt> ...
+        size_t fmt = line.find(' ', 8);
+        fmt = fmt == std::string::npos ? fmt : line.find(' ', fmt + 1);
+        out.payload_type = fmt == std::string::npos ? -1 : atoi(line.c_str() + fmt + 1);
+      }
+      continue;
+    }
+    if (!in_audio)
+      continue;
+    if (line.rfind("a=control:", 0) == 0) {
+      out.control = trim(line.substr(10));
+    } else if (line.rfind("a=rtpmap:", 0) == 0) {
+      // a=rtpmap:<pt> <encoding>/<clock rate>[/<channels>]
+      const int pt = atoi(line.c_str() + 9);
+      const size_t space = line.find(' ');
+      if (pt != out.payload_type || space == std::string::npos)
+        continue;
+      const std::string spec = trim(line.substr(space + 1));
+      const size_t slash1 = spec.find('/');
+      out.encoding = spec.substr(0, slash1);
+      if (slash1 != std::string::npos) {
+        out.clock_rate = strtoul(spec.c_str() + slash1 + 1, nullptr, 10);
+        const size_t slash2 = spec.find('/', slash1 + 1);
+        if (slash2 != std::string::npos)
+          out.channels = std::max(1, atoi(spec.c_str() + slash2 + 1));
+      }
+    }
+  }
+  if (!found)
+    return false;
+  if (out.encoding.empty()) {
+    // Static payload types (RFC 3551), for which a=rtpmap is optional.
+    switch (out.payload_type) {
+      case 0:
+        out.encoding = "PCMU";
+        break;
+      case 8:
+        out.encoding = "PCMA";
+        break;
+      case 10:
+        out.encoding = "L16";
+        out.channels = 2;
+        break;
+      case 11:
+        out.encoding = "L16";
+        break;
+      default:
+        break;
+    }
+  }
+  if (out.clock_rate == 0)
+    out.clock_rate = out.payload_type == 10 || out.payload_type == 11 ? 44100 : 8000;
+  return true;
+}
+
 std::string resolve_control_url(const std::string &base, const std::string &control) {
   if (control.empty() || control == "*")
     return base;

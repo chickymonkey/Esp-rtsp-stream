@@ -1,6 +1,6 @@
 # esp_rtsp_stream
 
-ESPHome external component that shows an RTSP **MJPEG** camera stream (Hikvision, Dahua and other ONVIF-style IP cameras) on an ESP32-S3 or ESP32-P4 display.
+ESPHome external component that shows an RTSP **MJPEG** camera stream (Hikvision, Dahua and other ONVIF-style IP cameras) on an ESP32-S3 or ESP32-P4 display. It can also play the camera's **audio** track on an ESPHome speaker.
 
 It does not decode H.264/H.265. Set the camera stream you use, normally the sub-stream, to **MJPEG**.
 
@@ -10,6 +10,7 @@ It does not decode H.264/H.265. Set the camera stream you use, normally the sub-
 2. **RTP/JPEG (RFC 2435):** JPEG frames are rebuilt directly in a PSRAM buffer. Supported: types 0/1 (4:2:2 and 4:2:0), types 64/65 (restart markers), Q 1–99 (standard tables) and Q 128–255 (in-band tables).
 3. **Decoding:** a separate task decodes each frame to RGB565. A frame that arrives while the decoder is busy, or faster than `max_fps`, is dropped. The picture always shows the newest frame and never builds a backlog.
 4. **Display:** decoded frames are double-buffered. `id(cam).draw(it)` draws the newest frame from a display lambda.
+5. **Audio (optional):** if an `audio:` block is set, the camera's audio track is set up on the same TCP connection. G.711 or L16 audio is decoded, mixed to mono, resampled to the speaker's rate and sent to an ESPHome `speaker`. See [Audio](#audio).
 
 ## Per-chip profiles
 
@@ -96,6 +97,7 @@ All options:
 | `max_fps` | 12 (S3), 25 (P4) | Frames shown per second at most |
 | `max_frame_size` | 256 KB (S3), 1 MB (P4) | Largest JPEG frame accepted |
 | `log_frame_info` | true | Stats line every 30 s |
+| `audio` | — | Play the camera audio on a speaker; see [Audio](#audio) |
 
 ### Switching cameras
 
@@ -193,15 +195,293 @@ go2rtc:
       - "ffmpeg:PorchDahuaFrigate#video=mjpeg"
 ```
 
-Then set the helper to `rtsp://FRIGATE_IP:8554/porch_esp`. The conversion runs on the server.
+Then set the helper to `rtsp://FRIGATE_IP:8554/porch_esp`. The conversion runs on the server. To get audio as well, see [go2rtc / Frigate with audio](#go2rtc--frigate-with-audio).
 
 
+
+## Audio
+
+Audio is optional. Add an `audio:` block that points at an ESPHome `speaker`, and the camera's sound plays alongside the picture.
+
+```yaml
+esp_rtsp_stream:
+  - id: front_door
+    # ... as above ...
+    audio:
+      speaker: box_speaker     # any ESPHome speaker: i2s_audio, mixer, resampler ...
+      sample_rate: 16000       # the rate your speaker runs at (default 16000)
+      muted: false             # start muted (default false)
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `speaker` | — | Speaker to play the camera audio on |
+| `sample_rate` | 16000 | Rate the speaker runs at. Camera audio is resampled to it, so set it to the speaker's `sample_rate`. |
+| `muted` | false | Start muted. Change at runtime with `set_audio_muted()`. |
+
+How it behaves:
+- **Same connection:** audio travels on the same RTSP TCP connection as the picture, on its own interleaved channel.
+- **Follows the picture:** audio only plays while the picture is wanted. When the LVGL canvas page is hidden, the speaker is stopped.
+- **No backlog:** packets that arrive while the speaker is full, muted or still starting are dropped. Sound never falls behind.
+- **Optional track:** a camera without audio, or with an unsupported codec, logs one warning and streams video only.
+- **Speaker buffer:** the speaker's `buffer_duration` absorbs WiFi jitter. The default of 500 ms is a good start.
+
+### Supported audio codecs
+
+| Codec | SDP name | Typical source |
+|---|---|---|
+| G.711 A-law | `PCMA` | Dahua "G.711A", Hikvision "G.711alaw", go2rtc `#audio=pcma` |
+| G.711 µ-law | `PCMU` | Hikvision "G.711ulaw", go2rtc `#audio=pcmu` |
+| Linear PCM | `L16` | go2rtc `#audio=pcm/16000`, any rate, mono or stereo |
+
+AAC (the Dahua default), Opus and G.726 are not decoded. Change the camera's audio encoding, or let go2rtc convert it.
+
+### Camera audio setup
+
+| Camera | Setting |
+|---|---|
+| Dahua | Setup → Camera → Audio → *Sub Stream* → **Enable**, Encode Mode **G.711A** |
+| Hikvision | Configuration → Video/Audio → *Sub Stream* → Stream Type **Video&Audio**; Audio → Audio Encoding **G.711alaw** |
+
+### go2rtc / Frigate with audio
+
+The Opus track that Frigate makes for browsers (`#audio=opus`) can't be played on the ESP32. Add a separate stream for the ESP32 with MJPEG video and G.711 audio:
+
+```yaml
+go2rtc:
+  streams:
+    PorchDahuaFrigate:
+      - rtsp://viewer:PASSWORD@192.168.3.160:554/cam/realmonitor?channel=1&subtype=0
+      - ffmpeg:PorchDahuaFrigate#audio=opus
+    porch_esp:
+      - "ffmpeg:PorchDahuaFrigate#video=mjpeg#audio=pcma"
+```
+
+Then set the helper to `rtsp://FRIGATE_IP:8554/porch_esp`. Use `#audio=pcm/16000` instead for slightly better sound with no resampling on a 16 kHz speaker. It uses about 256 kbit/s instead of 64 kbit/s.
+
+### Example: ESP32-S3-BOX-3 speaker
+
+The BOX-3 has an ES8311 codec and an amplifier switched by GPIO46. Check the pins against your board revision.
+
+```yaml
+i2c:
+  - id: bus_a
+    sda: GPIO8
+    scl: GPIO18
+
+i2s_audio:
+  - id: i2s_audio_bus
+    i2s_lrclk_pin: GPIO45
+    i2s_bclk_pin: GPIO17
+    i2s_mclk_pin: GPIO2
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+speaker:
+  - platform: i2s_audio
+    id: box_speaker
+    i2s_audio_id: i2s_audio_bus
+    i2s_dout_pin: GPIO15
+    dac_type: external
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: left
+    audio_dac: es8311_dac
+
+switch:
+  - platform: gpio
+    name: Speaker amplifier
+    pin: GPIO46
+    restore_mode: ALWAYS_ON
+```
+
+If the speaker is also used by a voice assistant or media player, don't give `esp_rtsp_stream` the same speaker. Each would start, stop and write to it on its own. Put a `mixer` speaker in front of it and give each user its own source speaker:
+
+```yaml
+speaker:
+  - platform: i2s_audio
+    id: box_speaker
+    # ... pins and audio_dac as above ...
+    sample_rate: 48000
+  - platform: mixer
+    id: box_mixer                # not "mixer_speaker": that name clashes with ESPHome's C++ namespace
+    output_speaker: box_speaker
+    num_channels: 1
+    source_speakers:
+      - id: announcement_speaker   # media_player -> announcement_pipeline -> speaker
+      - id: camera_speaker         # esp_rtsp_stream -> audio -> speaker
+
+esp_rtsp_stream:
+  - id: front_door
+    audio:
+      speaker: camera_speaker
+      sample_rate: 48000           # the mixer runs at the output speaker's rate
+```
+
+### Mute switch
+
+A template switch turns the camera audio on and off from Home Assistant. Make it `optimistic`, so its state and any icon on the screen change as soon as it is pressed. A switch that reads its state from a `lambda` is only polled every 60 s.
+
+```yaml
+esp_rtsp_stream:
+  - id: front_door
+    audio:
+      speaker: camera_speaker
+      sample_rate: 48000
+      muted: true                  # start muted, matching the switch below
+
+switch:
+  - platform: template
+    id: camera_audio_switch
+    name: Camera RTSP audio
+    icon: "mdi:cctv"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: id(front_door).set_audio_muted(false);
+    turn_off_action:
+      - lambda: id(front_door).set_audio_muted(true);
+```
+
+### Voice assistant and micro wake word (shared I2S bus)
+
+On the ESP32-S3-BOX-3, the microphone and the speaker share one I2S bus, and ESPHome lets only one of them use it at a time. Micro wake word (mWW) keeps the microphone capturing all the time, so the camera audio can't start. The log then shows:
+
+```
+[E][i2s_audio.speaker.std:401]: Parent bus is busy
+[E][i2s_audio.speaker:134]: Driver failed to start; retrying in 1 second
+```
+
+There is no way round this on that wiring: the shared clock pins can't run the microphone at 16 kHz and the speaker at 48 kHz at once. The media player has the same limit, which is why the BOX-3 voice assistant config stops the wake word in `on_announcement`. Camera audio needs the same treatment. The switch frees the microphone before it unmutes and gives it back after it mutes, so the wake word is off while camera audio plays.
+
+The actions below use the `stop_wake_word` and `start_wake_word` scripts and the `wake_word_engine_location` select from the [ESPHome BOX-3 voice assistant config](https://github.com/esphome/wake-word-voice-assistants). Use the names from your own config if they differ.
+
+```yaml
+switch:
+  - platform: template
+    id: camera_audio_switch
+    name: Camera RTSP audio
+    icon: "mdi:cctv"
+    optimistic: true
+    restore_mode: ALWAYS_OFF          # matches muted: true in esp_rtsp_stream
+    turn_on_action:
+      # Free the I2S bus: stop the wake word, as on_announcement does
+      - if:
+          condition:
+            - microphone.is_capturing:
+          then:
+            - script.execute: stop_wake_word
+            - if:
+                condition:
+                  - lambda: return id(wake_word_engine_location).current_option() == "In Home Assistant";
+                then:
+                  - wait_until:
+                      - not:
+                          voice_assistant.is_running:
+            - wait_until:
+                condition:
+                  - not:
+                      microphone.is_capturing:
+                timeout: 2s
+      - lambda: id(front_door).set_audio_muted(false);
+    turn_off_action:
+      - lambda: id(front_door).set_audio_muted(true);
+      # Wait for the speaker to release the bus, then listen again
+      - wait_until:
+          condition:
+            - speaker.is_stopped: box_speaker
+          timeout: 3s
+      - script.execute: start_wake_word
+    on_turn_on:
+      - lvgl.label.update:
+          id: cam_audio_icon
+          text: "\U000F057E"   # mdi:volume-high
+          text_color: 0x00FF00
+    on_turn_off:
+      - lvgl.label.update:
+          id: cam_audio_icon
+          text: "\U000F0581"   # mdi:volume-off
+          text_color: white
+```
+
+Leave out `on_turn_on` and `on_turn_off` if you don't use the on-screen button below. Other things that restart the wake word, such as the media player's `on_idle` after an announcement, hit the same busy-bus error while camera audio is on. Turn camera audio off and on again if that happens.
+
+### LVGL page with a mute button
+
+This page shows the camera with a round mute button in its top-left corner. The button is listed after the canvas, so it is drawn on top of the picture. Leaving the page turns the audio off, which also hands the microphone back to the wake word.
+
+```yaml
+font:
+  # Material Design Icons; any icon font with these two glyphs works
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: icon_font_25
+    size: 25
+    glyphs:
+      - "\U000F057E"   # mdi:volume-high
+      - "\U000F0581"   # mdi:volume-off
+
+lvgl:
+  pages:
+    - id: camera_page
+      bg_color: black
+      scrollbar_mode: "off"
+      scrollable: false
+      on_unload:
+        # Only when audio is on; otherwise each page change would restart the wake word, even during music
+        - if:
+            condition:
+              switch.is_on: camera_audio_switch
+            then:
+              - switch.turn_off: camera_audio_switch
+      widgets:
+        - canvas:
+            id: cam_canvas
+            x: 0
+            y: 0
+            width: 320
+            height: 240
+
+        - button:
+            id: cam_audio_btn
+            x: 4
+            y: 4
+            width: 40
+            height: 40
+            radius: 20
+            bg_color: black
+            bg_opa: 50%
+            border_width: 0
+            shadow_width: 0
+            on_click:
+              - switch.toggle: camera_audio_switch
+            widgets:
+              - label:
+                  id: cam_audio_icon
+                  align: CENTER
+                  text_font: icon_font_25
+                  text_color: white
+                  text: "\U000F0581"   # starts muted
+```
+
+How it behaves:
+- **Muted:** a white crossed-out speaker. The wake word listens as usual.
+- **Tap to listen:** the icon turns into a green speaker. The wake word stops, then camera audio starts.
+- **Tap again, or leave the page:** camera audio stops and the wake word starts again.
+- **In sync:** the button and the Home Assistant switch always agree, because both drive the same switch.
+- **Overlays:** anything on LVGL's `top_layer`, such as a voice assistant notice bar, is drawn above the button and can cover it.
 
 ## Limitations
 
-- MJPEG only; no H.264/H.265, and no audio.
+- MJPEG only; no H.264/H.265.
+- Audio must be G.711 (PCMA/PCMU) or L16. AAC, Opus and G.726 are not decoded; ( let go2rtc convert them if you have frigate installed).
+- Audio and picture are not lip-synced. Each plays as soon as it arrives, which is close enough for a door camera in LAN.
+- On boards where the microphone and speaker share one I2S bus, such as the ESP32-S3-BOX-3, the wake word is off while camera audio plays. See [Voice assistant and micro wake word](#voice-assistant-and-micro-wake-word-shared-i2s-bus).
 - RTP over TCP only. A camera that refuses TCP transport fails at SETUP.
-- 8-bit quantisation tables only; 16-bit tables are rare.
+- 8-bit quantisation tables only.
 
 ## Tested Board-screen
 
@@ -213,3 +493,4 @@ Then set the helper to `rtsp://FRIGATE_IP:8554/porch_esp`. The conversion runs o
 - `draw(it)` / `draw(it, x, y)`: draw the newest frame (display lambda).
 - `has_frame()`, `is_streaming()`, `get_frame_width()`, `get_frame_height()`
 - `get_frame_count()`, `get_dropped_frames()`, `get_last_decode_ms()`
+- `set_audio_muted(bool)`, `is_audio_muted()`, `is_audio_playing()`: camera audio control

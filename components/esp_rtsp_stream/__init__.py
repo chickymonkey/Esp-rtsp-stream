@@ -1,5 +1,5 @@
 import esphome.codegen as cg
-from esphome.components import display, esp32
+from esphome.components import display, esp32, speaker
 from esphome.components.esp32.const import VARIANT_ESP32P4, VARIANT_ESP32S3
 import esphome.config_validation as cv
 from esphome.const import (
@@ -29,6 +29,19 @@ CONF_OUTPUT_HEIGHT = "output_height"
 CONF_MAX_FRAME_SIZE = "max_frame_size"
 CONF_LOG_FRAME_INFO = "log_frame_info"
 CONF_LVGL_CANVAS = "lvgl_canvas"
+CONF_AUDIO = "audio"
+CONF_SPEAKER = "speaker"
+CONF_SAMPLE_RATE = "sample_rate"
+CONF_MUTED = "muted"
+
+AUDIO_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_SPEAKER): cv.use_id(speaker.Speaker),
+        # The rate the speaker runs at. Camera audio (usually 8 kHz G.711) is resampled to it.
+        cv.Optional(CONF_SAMPLE_RATE, default=16000): cv.int_range(min=8000, max=48000),
+        cv.Optional(CONF_MUTED, default=False): cv.boolean,
+    }
+)
 
 
 def _lvgl_canvas_id(value):
@@ -107,6 +120,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_DISPLAY_ID): cv.use_id(display.Display),
             cv.Optional(CONF_LVGL_CANVAS): _lvgl_canvas_id,
             cv.Optional(CONF_LOG_FRAME_INFO, default=True): cv.boolean,
+            cv.Optional(CONF_AUDIO): AUDIO_SCHEMA,
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
@@ -173,3 +187,11 @@ async def to_code(config):
     # A larger TCP window keeps the camera sending while a frame is being decoded.
     _sdkconfig_default("CONFIG_LWIP_TCP_WND_DEFAULT", profile["tcp_window"])
     _sdkconfig_default("CONFIG_LWIP_TCP_RECVMBOX_SIZE", profile["tcp_recvmbox"])
+
+    if CONF_AUDIO in config:
+        audio = config[CONF_AUDIO]
+        spk = await cg.get_variable(audio[CONF_SPEAKER])
+        cg.add_define("USE_ESP_RTSP_STREAM_AUDIO")
+        cg.add(var.set_speaker(spk))
+        cg.add(var.set_audio_sample_rate(audio[CONF_SAMPLE_RATE]))
+        cg.add(var.set_audio_muted(audio[CONF_MUTED]))

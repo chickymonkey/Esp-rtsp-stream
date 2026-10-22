@@ -35,6 +35,18 @@ struct SdpVideoTrack {
 
 /// Picks the first m=video section of an SDP body.
 bool parse_sdp_video(const std::string &sdp, SdpVideoTrack &out);
+
+struct SdpAudioTrack {
+  int payload_type{-1};
+  std::string encoding;  // from a=rtpmap or the static payload type, e.g. "PCMA", "L16", "MPEG4-GENERIC"
+  uint32_t clock_rate{0};
+  int channels{1};
+  std::string control;  // media-level a=control
+};
+
+/// Picks the first m=audio section of an SDP body.
+bool parse_sdp_audio(const std::string &sdp, SdpAudioTrack &out);
+
 /// Resolves an a=control value against the DESCRIBE base URL (RFC 2326 C.1.1).
 std::string resolve_control_url(const std::string &base, const std::string &control);
 
