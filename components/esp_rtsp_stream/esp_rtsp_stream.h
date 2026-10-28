@@ -217,9 +217,12 @@ class RtspMjpeg : public Component {
   std::atomic<bool> decoder_busy_{false};
 
   // RGB565 double buffer: the decoder writes rgb_[front_ ^ 1], draw() reads rgb_[front_].
+  // With only an LVGL canvas the canvas holds the shown copy, so a single buffer (rgb_[front_]) is used
+  // and the decoder holds frame_mutex_ while it writes.
   std::mutex frame_mutex_;
   uint8_t *rgb_[2]{nullptr, nullptr};
   size_t rgb_capacity_[2]{0, 0};
+  bool single_buffer_{false};
   int back_width_{0};
   int back_height_{0};
   int back_stride_{0};

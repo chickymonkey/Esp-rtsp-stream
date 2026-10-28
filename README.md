@@ -528,7 +528,7 @@ Things that look wrong but aren't:
 ## Tested Board-screen
 
 - **ESP32-S3-BOX-3**, 2.4-inch 320×240 SPI TFT. Dahua 640×480 MJPEG sub-stream with G.711A audio, LVGL canvas 300×225, with voice assistant, micro wake word and media player running: about 5.6 fps, 86 ms decode, 0 corrupt frames.
-  
+- **Guition 10.1" ESP32-P4**, (2026 version - new P4 chip, new touch ) 10.1" 800×1280 MIPI-DSI (JD9365) ESP32-P4, production silicon (chip revision v3.x), ESP32-C6 co-processor over SDIO. 16 MB flash, 32 MB hex PSRAM. ES8311 codec (0x18), NS4150 amplifier (PA_CTRL GPIO20) OV02C10 2 MP MIPI-CSI (0x36)
 ## C++ API
 
 - `set_url(url)`, `set_credentials(user, pass)`: switch camera at runtime.

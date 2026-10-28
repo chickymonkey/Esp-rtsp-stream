@@ -66,6 +66,15 @@ void RtspMjpeg::request_reconnect_() {
 }
 
 void RtspMjpeg::setup() {
+#ifdef USE_LVGL
+  // The canvas keeps its own copy of the shown frame, so one decode buffer is enough (saves a full frame of PSRAM).
+  this->single_buffer_ = this->lvgl_canvas_ != nullptr;
+#endif
+#ifdef USE_DISPLAY
+  if (this->display_ != nullptr)
+    this->single_buffer_ = false;  // draw() reads the frame buffer directly
+#endif
+
   for (auto &buf : this->jpeg_buffers_) {
     buf = this->alloc_jpeg_buffer_(this->max_frame_size_);
     if (buf == nullptr) {
@@ -681,6 +690,12 @@ void RtspMjpeg::decode_loop_() {
         this->release_frame_buffers_();
       continue;
     }
+    std::unique_lock<std::mutex> lock(this->frame_mutex_, std::defer_lock);
+    if (this->single_buffer_) {
+      // The canvas copy reads the buffer this decode overwrites; a frame not copied yet is skipped.
+      lock.lock();
+      this->new_frame_ = false;
+    }
     const uint32_t start = millis();
     const bool ok = this->decode_frame_(this->jpeg_buffers_[this->ready_index_], this->ready_len_, this->ready_width_,
                                         this->ready_height_);
@@ -691,13 +706,14 @@ void RtspMjpeg::decode_loop_() {
       continue;
     }
 
-    {
-      std::lock_guard<std::mutex> lock(this->frame_mutex_);
+    if (!lock.owns_lock())
+      lock.lock();
+    if (!this->single_buffer_)
       this->front_ ^= 1;
-      this->front_width_ = this->back_width_;
-      this->front_height_ = this->back_height_;
-      this->front_stride_ = this->back_stride_;
-    }
+    this->front_width_ = this->back_width_;
+    this->front_height_ = this->back_height_;
+    this->front_stride_ = this->back_stride_;
+    lock.unlock();
     if (++this->decoded_frames_ == 1) {
       ESP_LOGI(TAG, "First frame: %dx%d stream -> %dx%d output, decoded in %u ms", this->ready_width_,
                this->ready_height_, this->back_width_, this->back_height_, (unsigned) this->last_decode_ms_.load());
@@ -902,7 +918,7 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
   const size_t decoded_bytes = static_cast<size_t>(padded_w) * padded_h * 2;
 
   const OutputPlan plan = this->plan_output_(src_width, src_height);
-  const int back = this->front_ ^ 1;
+  const int back = this->single_buffer_ ? this->front_ : this->front_ ^ 1;
   const bool direct = this->rotation_ == 0 && plan.target_width == src_width && plan.target_height == src_height;
 
   uint8_t *&target = direct ? this->rgb_[back] : this->staging_;
@@ -966,7 +982,7 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
 #else
 
 bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, int src_height) {
-  const int back = this->front_ ^ 1;
+  const int back = this->single_buffer_ ? this->front_ : this->front_ ^ 1;
   // The RTP header gives the size up front; a pass-through JPEG might differ, so retry once with the real size.
   for (int attempt = 0; attempt < 2; attempt++) {
     const OutputPlan plan = this->plan_output_(src_width, src_height);
