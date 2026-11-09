@@ -203,7 +203,7 @@ With `h264: true` the component accepts both MJPEG and H.264 and picks whichever
 
 **What is supported**
 
-- **Baseline profile only.** Espressif's decoder (tinyh264-based, `espressif/esp_h264` 1.5.0) handles Constrained Baseline. Main and High profile streams (CABAC, B-frames) fail to decode, and the log warns about the profile at connect time. Set the sub-stream's H.264 profile to Baseline:
+- **Baseline profile only.** Espressif's decoder (tinyh264-based, `espressif/esp_h264` 1.3.8 or newer; 1.3.x is picked when `esp_video` is also in the build) handles Constrained Baseline. Main and High profile streams (CABAC, B-frames) fail to decode, and the log warns about the profile at connect time. Set the sub-stream's H.264 profile to Baseline:
   - **Hikvision:** Video/Audio → Sub Stream → *Profile* **Basic Profile**, and *SVC* off.
   - **Dahua:** Video → Sub Stream → Encode Mode **H.264B**.
 - **No hardware decoder.** The ESP32-P4 has a hardware H.264 *encoder* but no decoder, so both chips decode in software.

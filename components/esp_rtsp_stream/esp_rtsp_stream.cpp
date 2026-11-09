@@ -1501,7 +1501,9 @@ void RtspMjpeg::decode_h264_access_unit_(const uint8_t *item, size_t size) {
     if (err != ESP_H264_ERR_OK) {
       ESP_LOGD(TAG, "H.264 decode failed: %d", (int) err);
       this->corrupt_frames_++;
-      this->h264_synced_ = false;  // later pictures reference this one: wait for the next IDR picture
+      // Restart from a fresh decoder at the next IDR picture: later pictures reference this one, and
+      // esp_h264 before 1.5.0 could crash when it kept decoding after a corrupted slice.
+      this->close_h264_decoder_();
       return;
     }
     if (in.consume == 0 || in.consume > in.raw_data.len)

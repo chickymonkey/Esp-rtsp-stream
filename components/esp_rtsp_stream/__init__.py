@@ -38,7 +38,9 @@ CONF_H264 = "h264"
 
 # Software H.264 decoder (tinyh264 based, Baseline profile only). Neither chip has an H.264 decoder in
 # hardware; the P4 only has an encoder. Published speeds at 640x480: ~9 fps on ESP32-S3, ~25 fps on ESP32-P4.
-H264_IDF_COMPONENT = ("espressif/esp_h264", "1.5.0")
+# A range, not a pin: espressif/esp_video (used by P4 camera/intercom packages) requires esp_h264 1.3.*, so the
+# solver must be free to pick 1.3.x there. The decoder API is identical from 1.3.0 to 1.5.x.
+H264_IDF_COMPONENT = ("espressif/esp_h264", "^1.3.8")
 
 AUDIO_SCHEMA = cv.Schema(
     {
