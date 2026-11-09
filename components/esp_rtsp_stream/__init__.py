@@ -10,6 +10,7 @@ from esphome.const import (
     CONF_URL,
     CONF_USERNAME,
 )
+from esphome.core import CORE
 import esphome.final_validate as fv
 
 try:
@@ -162,6 +163,29 @@ def _sdkconfig_default(name, value):
         esp32.add_idf_sdkconfig_option(name, value)
 
 
+def _use_idf_component(name, ref):
+    """Adds a registry IDF component and puts its headers on the include path of ESPHome's code.
+
+    Newer ESPHome (2026.10+) only downloads components added with add_idf_component: its `src` component
+    REQUIRES built-in IDF components only, so a managed component's public include dirs never reach our
+    sources. Linking the component's library into `src` (after idf_component_register) fixes that.
+    """
+    esp32.add_idf_component(name=name, ref=ref)
+    add_src_cmake = getattr(esp32, "add_src_cmake", None)
+    if add_src_cmake is None:
+        return  # older ESPHome, where src REQUIRES its managed components itself
+    done = CORE.data.setdefault("esp_rtsp_stream_linked", set())
+    if name in done:
+        return  # MULTI_CONF: once per component, not per stream
+    done.add(name)
+    idf_name = name.replace("/", "__")  # espressif/esp_h264 -> espressif__esp_h264
+    var = "esp_rtsp_stream_" + idf_name.replace("-", "_")
+    add_src_cmake(
+        f"idf_component_get_property({var} {idf_name} COMPONENT_LIB)\n"
+        f"target_link_libraries(${{COMPONENT_LIB}} PRIVATE ${{{var}}})\n"
+    )
+
+
 async def to_code(config):
     profile = _profile()
     var = cg.new_Pvariable(config[CONF_ID])
@@ -200,13 +224,13 @@ async def to_code(config):
 
     if profile["idf_component"] is not None:
         name, ref = profile["idf_component"]
-        esp32.add_idf_component(name=name, ref=ref)
+        _use_idf_component(name, ref)
     if profile["define"] is not None:
         cg.add_define(profile["define"])
     if config[CONF_H264]:
         # The define is global, so one stream with h264: true builds the decoder for all of them.
         name, ref = H264_IDF_COMPONENT
-        esp32.add_idf_component(name=name, ref=ref)
+        _use_idf_component(name, ref)
         cg.add_define("USE_ESP_RTSP_STREAM_H264")
 
     # A larger TCP window keeps the camera sending while a frame is being decoded.
