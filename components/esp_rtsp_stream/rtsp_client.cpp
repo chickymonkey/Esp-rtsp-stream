@@ -215,6 +215,11 @@ bool parse_sdp_video(const std::string &sdp, SdpVideoTrack &out) {
       const size_t space = line.find(' ');
       if (pt == out.payload_type && space != std::string::npos)
         out.encoding = line.substr(space + 1, line.find('/', space) - space - 1);
+    } else if (section == VIDEO && line.rfind("a=fmtp:", 0) == 0) {
+      const int pt = atoi(line.c_str() + 7);
+      const size_t space = line.find(' ');
+      if (pt == out.payload_type && space != std::string::npos)
+        out.fmtp = trim(line.substr(space + 1));
     }
   }
   if (found && out.encoding.empty() && out.payload_type == 26)

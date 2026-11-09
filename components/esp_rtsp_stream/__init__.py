@@ -34,6 +34,11 @@ CONF_AUDIO = "audio"
 CONF_SPEAKER = "speaker"
 CONF_SAMPLE_RATE = "sample_rate"
 CONF_MUTED = "muted"
+CONF_H264 = "h264"
+
+# Software H.264 decoder (tinyh264 based, Baseline profile only). Neither chip has an H.264 decoder in
+# hardware; the P4 only has an encoder. Published speeds at 640x480: ~9 fps on ESP32-S3, ~25 fps on ESP32-P4.
+H264_IDF_COMPONENT = ("espressif/esp_h264", "1.5.0")
 
 AUDIO_SCHEMA = cv.Schema(
     {
@@ -126,6 +131,8 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_LOG_FRAME_INFO, default=True): cv.boolean,
             cv.Optional(CONF_AUDIO): AUDIO_SCHEMA,
+            # Also accept H.264 (Baseline profile) streams. Off by default: it adds the esp_h264 decoder.
+            cv.Optional(CONF_H264, default=False): cv.boolean,
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
@@ -194,6 +201,11 @@ async def to_code(config):
         esp32.add_idf_component(name=name, ref=ref)
     if profile["define"] is not None:
         cg.add_define(profile["define"])
+    if config[CONF_H264]:
+        # The define is global, so one stream with h264: true builds the decoder for all of them.
+        name, ref = H264_IDF_COMPONENT
+        esp32.add_idf_component(name=name, ref=ref)
+        cg.add_define("USE_ESP_RTSP_STREAM_H264")
 
     # A larger TCP window keeps the camera sending while a frame is being decoded.
     _sdkconfig_default("CONFIG_LWIP_TCP_WND_DEFAULT", profile["tcp_window"])
