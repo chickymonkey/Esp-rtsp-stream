@@ -1,3 +1,5 @@
+import os
+
 import esphome.codegen as cg
 from esphome.components import display, esp32, speaker
 from esphome.components.esp32.const import VARIANT_ESP32P4, VARIANT_ESP32S3
@@ -163,27 +165,44 @@ def _sdkconfig_default(name, value):
         esp32.add_idf_sdkconfig_option(name, value)
 
 
+# Public include dirs of the registry components we use, relative to the component's root.
+IDF_COMPONENT_INCLUDE_DIRS = {
+    "espressif/esp_h264": ["interface/include", "sw/include", "port/include", "hw/include"],
+    "espressif/esp_new_jpeg": ["include"],
+}
+
+
 def _use_idf_component(name, ref):
     """Adds a registry IDF component and puts its headers on the include path of ESPHome's code.
 
-    Newer ESPHome (2026.10+) only downloads components added with add_idf_component: its `src` component
-    REQUIRES built-in IDF components only, so a managed component's public include dirs never reach our
-    sources. Linking the component's library into `src` (after idf_component_register) fixes that.
+    Native ESP-IDF builds (ESPHome 2026.10+) only download components added with add_idf_component: the
+    generated `src` component REQUIRES built-in IDF components only, so a managed component's public include
+    dirs never reach our sources. ESP-IDF still builds and links the component, so only the headers are
+    missing.
     """
     esp32.add_idf_component(name=name, ref=ref)
-    add_src_cmake = getattr(esp32, "add_src_cmake", None)
-    if add_src_cmake is None:
-        return  # older ESPHome, where src REQUIRES its managed components itself
     done = CORE.data.setdefault("esp_rtsp_stream_linked", set())
     if name in done:
         return  # MULTI_CONF: once per component, not per stream
     done.add(name)
     idf_name = name.replace("/", "__")  # espressif/esp_h264 -> espressif__esp_h264
-    var = "esp_rtsp_stream_" + idf_name.replace("-", "_")
-    add_src_cmake(
-        f"idf_component_get_property({var} {idf_name} COMPONENT_LIB)\n"
-        f"target_link_libraries(${{COMPONENT_LIB}} PRIVATE ${{{var}}})\n"
-    )
+
+    add_src_cmake = getattr(esp32, "add_src_cmake", None)
+    if add_src_cmake is not None:
+        # Newer ESPHome: link the component into src, which also brings its public include dirs.
+        var = "esp_rtsp_stream_" + idf_name.replace("-", "_")
+        add_src_cmake(
+            f"idf_component_get_property({var} {idf_name} COMPONENT_LIB)\n"
+            f"target_link_libraries(${{COMPONENT_LIB}} PRIVATE ${{{var}}})\n"
+        )
+        return
+
+    # ESPHome 2026.10.x has no hook into src's CMake, and only passes -D/-W build flags to the compiler.
+    # -Wp,-I<dir> is GCC's way of handing -I<dir> to the preprocessor, so it gets through. The component
+    # manager downloads into <build>/managed_components/<owner>__<name> before anything is compiled.
+    root = str(CORE.relative_build_path("managed_components", idf_name))
+    for sub in IDF_COMPONENT_INCLUDE_DIRS.get(name, ["include"]):
+        cg.add_build_flag(f"-Wp,-I{os.path.join(root, sub)}")
 
 
 async def to_code(config):
