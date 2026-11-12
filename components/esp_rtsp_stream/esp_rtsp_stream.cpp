@@ -17,6 +17,9 @@
 #ifndef USE_ESP_RTSP_STREAM_HW_JPEG
 #include "esp_jpeg_dec.h"
 #endif
+#if defined(USE_ESP_RTSP_STREAM_HW_JPEG) && defined(USE_ESP_RTSP_STREAM_H264)
+#include "esp_cache.h"
+#endif
 
 namespace esphome {
 namespace esp_rtsp_stream {
@@ -29,6 +32,26 @@ static const size_t AUDIO_MAX_PACKET = 4096;
 static const char *const DECODER_NAME = "ESP32-P4 hardware JPEG + PPA scaler";
 #else
 static const char *const DECODER_NAME = "esp_new_jpeg (software, SIMD on ESP32-S3)";
+#endif
+
+#ifdef USE_ESP_RTSP_STREAM_H264
+// The software H.264 decoder runs in the decode task and needs more stack than the JPEG decoders.
+static const uint32_t DECODE_TASK_STACK = 16384;
+#else
+static const uint32_t DECODE_TASK_STACK = 8192;
+#endif
+
+#ifdef USE_ESP_RTSP_STREAM_H264
+/// Precedes every H.264 access unit in the queue.
+struct H264QueueHeader {
+  uint32_t generation;
+  uint32_t timestamp;  // RTP timestamp (90 kHz)
+  uint8_t idr;
+  uint8_t reserved[3];
+};
+// Skip ahead to the next IDR picture once the decoder is this far behind the camera.
+static const uint32_t H264_MAX_LAG_MS = 1000;
+static const uint8_t H264_START_CODE[4] = {0, 0, 0, 1};
 #endif
 
 void RtspMjpeg::set_url(const std::string &url) {
@@ -102,7 +125,7 @@ void RtspMjpeg::setup() {
   }
 #endif
 
-  if (xTaskCreatePinnedToCore(decode_task_, "rtsp_dec", 8192, this, 1, &this->decode_task_handle_,
+  if (xTaskCreatePinnedToCore(decode_task_, "rtsp_dec", DECODE_TASK_STACK, this, 1, &this->decode_task_handle_,
                               this->decode_core_) != pdPASS ||
       xTaskCreatePinnedToCore(network_task_, "rtsp_net", 8192, this, 5, &this->network_task_handle_,
                               this->network_core_) != pdPASS) {
@@ -174,7 +197,7 @@ void RtspMjpeg::loop() {
 }
 
 void RtspMjpeg::dump_config() {
-  ESP_LOGCONFIG(TAG, "RTSP MJPEG stream:");
+  ESP_LOGCONFIG(TAG, "RTSP camera stream:");
   {
     std::lock_guard<std::mutex> lock(this->config_mutex_);
     RtspUrl parsed;
@@ -188,6 +211,11 @@ void RtspMjpeg::dump_config() {
     }
   }
   ESP_LOGCONFIG(TAG, "  Decoder: %s", DECODER_NAME);
+#ifdef USE_ESP_RTSP_STREAM_H264
+  ESP_LOGCONFIG(TAG, "  H.264: esp_h264 software decoder (Baseline profile only)");
+#else
+  ESP_LOGCONFIG(TAG, "  H.264: off (MJPEG only)");
+#endif
   ESP_LOGCONFIG(TAG, "  Max FPS: %d", this->max_fps_);
   if (this->box_width_ > 0)
     ESP_LOGCONFIG(TAG, "  Fit into: %dx%d", this->box_width_, this->box_height_);
@@ -294,6 +322,7 @@ void RtspMjpeg::network_loop_() {
     const bool got_frames = this->run_session_();
     this->conn_.close();
     this->assembler_.abandon();
+    this->h264_assembler_.clear();
     this->streaming_ = false;
     this->audio_track_active_ = false;
     if (this->config_changed_) {
@@ -334,9 +363,25 @@ bool RtspMjpeg::run_session_() {
     ESP_LOGE(TAG, "Camera offers no video track");
     return false;
   }
-  if (strcasecmp(track.encoding.c_str(), "JPEG") != 0) {
-    ESP_LOGE(TAG, "Stream is %s, not MJPEG. Set this camera stream's encoding to MJPEG (usually the sub-stream)",
-             track.encoding.empty() ? "an unknown codec" : track.encoding.c_str());
+  if (strcasecmp(track.encoding.c_str(), "JPEG") == 0) {
+    this->codec_ = VideoCodec::MJPEG;
+  } else if (strcasecmp(track.encoding.c_str(), "H264") == 0) {
+#ifdef USE_ESP_RTSP_STREAM_H264
+    if (!this->ensure_h264_queue_())
+      return false;
+    this->codec_ = VideoCodec::H264;
+#else
+    ESP_LOGE(TAG, "Stream is H.264. Add `h264: true` to esp_rtsp_stream, or set the camera stream to MJPEG");
+    return false;
+#endif
+  } else {
+#ifdef USE_ESP_RTSP_STREAM_H264
+    const char *const supported = "MJPEG or H.264 (Baseline profile)";
+#else
+    const char *const supported = "MJPEG";
+#endif
+    ESP_LOGE(TAG, "Stream is %s, which is not supported. Set this camera stream's encoding to %s",
+             track.encoding.empty() ? "an unknown codec" : track.encoding.c_str(), supported);
     return false;
   }
   this->video_payload_type_ = track.payload_type;
@@ -424,12 +469,25 @@ bool RtspMjpeg::run_session_() {
     return false;
   }
 
-  ESP_LOGI(TAG, "Streaming MJPEG%s from %s", this->audio_channel_ != 255 ? " with audio" : "", url.host.c_str());
+  ESP_LOGI(TAG, "Streaming %s%s from %s", this->codec_ == VideoCodec::H264 ? "H.264" : "MJPEG",
+           this->audio_channel_ != 255 ? " with audio" : "", url.host.c_str());
   this->audio_track_active_ = this->audio_channel_ != 255;
   this->streaming_ = true;
   this->have_seq_ = false;
   this->session_frames_ = 0;
   this->assembler_.set_buffer(this->jpeg_buffers_[this->fill_index_], this->max_frame_size_);
+#ifdef USE_ESP_RTSP_STREAM_H264
+  if (this->codec_ == VideoCodec::H264) {
+    // jpeg_buffers_[fill_index_] is never the one the decode task reads, so it can hold the access unit.
+    this->h264_assembler_.set_buffer(this->jpeg_buffers_[this->fill_index_], this->max_frame_size_);
+    this->h264_assembler_.set_sdp_fmtp(track.fmtp);
+    this->h264_generation_++;  // the decode task restarts its decoder for the new stream
+    this->h264_need_idr_ = true;
+    this->h264_decoded_valid_ = false;  // no picture of this stream decoded yet
+    this->h264_logged_profile_ = 0;
+    this->h264_unsupported_nal_logged_ = false;
+  }
+#endif
 
   // Cameras drop sessions that stay silent for `timeout`; OPTIONS refreshes it on Hikvision and Dahua alike.
   const uint32_t keepalive_ms = timeout_s * 1000 / 2;
@@ -502,6 +560,7 @@ bool RtspMjpeg::handle_rtp_(uint16_t len) {
   const bool marker = rtp[1] & 0x80;
   const int payload_type = rtp[1] & 0x7F;
   const uint16_t seq = (rtp[2] << 8) | rtp[3];
+  [[maybe_unused]] const uint32_t timestamp = (static_cast<uint32_t>(rtp[4]) << 24) | (rtp[5] << 16) | (rtp[6] << 8) | rtp[7];
   if (!take(nullptr, (rtp[0] & 0x0F) * 4, ok))
     return ok;
   if (extension) {
@@ -512,12 +571,17 @@ bool RtspMjpeg::handle_rtp_(uint16_t len) {
   if (payload_type != this->video_payload_type_)
     return this->conn_.skip(len - used);
 
-  if (this->have_seq_ && seq != static_cast<uint16_t>(this->last_seq_ + 1) && this->assembler_.in_frame()) {
+  const bool lost = this->have_seq_ && seq != static_cast<uint16_t>(this->last_seq_ + 1);
+  this->have_seq_ = true;
+  this->last_seq_ = seq;
+#ifdef USE_ESP_RTSP_STREAM_H264
+  if (this->codec_ == VideoCodec::H264)
+    return this->handle_h264_payload_(len - used, marker, timestamp, padding, lost);
+#endif
+  if (lost && this->assembler_.in_frame()) {
     this->assembler_.abandon();
     this->corrupt_frames_++;
   }
-  this->have_seq_ = true;
-  this->last_seq_ = seq;
 
   uint8_t main_hdr[8];
   if (!take(main_hdr, sizeof(main_hdr), ok))
@@ -642,15 +706,10 @@ void RtspMjpeg::frame_complete_(size_t jpeg_len) {
     return;
 
   // Drop rather than queue: a backlog would show an ever older picture.
-  const uint32_t now = millis();
-  const uint32_t interval = 1000 / this->max_fps_;
-  if (static_cast<int32_t>(now + interval / 4 - this->next_frame_due_ms_) < 0 || this->decoder_busy_) {
+  if (this->decoder_busy_ || !this->frame_due_(this->next_frame_due_ms_)) {
     this->dropped_frames_++;
     return;
   }
-  this->next_frame_due_ms_ = static_cast<int32_t>(now - this->next_frame_due_ms_) > static_cast<int32_t>(interval)
-                                 ? now + interval
-                                 : this->next_frame_due_ms_ + interval;
 
   this->ready_index_ = this->fill_index_;
   this->ready_len_ = jpeg_len;
@@ -661,6 +720,248 @@ void RtspMjpeg::frame_complete_(size_t jpeg_len) {
   this->decoder_busy_ = true;
   xTaskNotifyGive(this->decode_task_handle_);
 }
+
+bool RtspMjpeg::frame_due_(uint32_t &next_due_ms) {
+  const uint32_t now = millis();
+  const uint32_t interval = 1000 / this->max_fps_;
+  if (static_cast<int32_t>(now + interval / 4 - next_due_ms) < 0)
+    return false;
+  next_due_ms = static_cast<int32_t>(now - next_due_ms) > static_cast<int32_t>(interval) ? now + interval
+                                                                                         : next_due_ms + interval;
+  return true;
+}
+
+#ifdef USE_ESP_RTSP_STREAM_H264
+
+bool RtspMjpeg::ensure_h264_queue_() {
+  if (this->h264_queue_ != nullptr)
+    return true;
+  // A no-split ring buffer holds items of up to about half its size, so this fits one max_frame_size access
+  // unit, or a backlog of many small P pictures while the decoder catches up.
+  const size_t size = (this->max_frame_size_ * 2 + 64 + 3) & ~static_cast<size_t>(3);
+  this->h264_queue_storage_ = static_cast<uint8_t *>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (this->h264_queue_storage_ == nullptr) {
+    ESP_LOGE(TAG, "Cannot allocate the %u byte H.264 queue", (unsigned) size);
+    return false;
+  }
+  RingbufHandle_t queue =
+      xRingbufferCreateStatic(size, RINGBUF_TYPE_NOSPLIT, this->h264_queue_storage_, &this->h264_queue_struct_);
+  if (queue == nullptr) {
+    ESP_LOGE(TAG, "Cannot create the H.264 queue");
+    heap_caps_free(this->h264_queue_storage_);
+    this->h264_queue_storage_ = nullptr;
+    return false;
+  }
+  this->h264_max_item_ = xRingbufferGetMaxItemSize(queue);
+  this->h264_queue_ = queue;
+  return true;
+}
+
+void RtspMjpeg::log_h264_profile_() {
+  // Logged again if the camera's SPS changes profile mid-session.
+  const int profile = this->h264_assembler_.profile_idc();
+  if (profile == this->h264_logged_profile_ || profile == 0)
+    return;
+  this->h264_logged_profile_ = profile;
+  if (profile == 66) {
+    ESP_LOGI(TAG, "H.264 Baseline profile");
+  } else {
+    ESP_LOGW(TAG,
+             "Camera sends H.264 %s profile (%d), but the decoder only supports Baseline. Set the camera "
+             "stream's H.264 profile to Baseline (Hikvision: Profile = Basic Profile; Dahua: H.264B)",
+             h264_profile_name(profile), profile);
+  }
+}
+
+bool RtspMjpeg::handle_h264_payload_(size_t len, bool marker, uint32_t timestamp, bool padding, bool lost) {
+  H264Assembler &au = this->h264_assembler_;
+  // A new timestamp starts a new access unit, even if the camera never set the marker bit on the last one.
+  if (au.started() && au.timestamp() != timestamp) {
+    if (lost)
+      au.mark_corrupt();  // the lost packet may have been the end of this unit
+    this->h264_access_unit_complete_();
+  }
+  if (!au.started())
+    au.start(timestamp);
+  if (lost)
+    au.mark_corrupt();
+
+  // Bytes of RTP padding at the end of what was just read into `data`.
+  auto pad = [padding](const uint8_t *data, size_t n) -> size_t {
+    return padding && n > 0 ? std::min<size_t>(data[n - 1], n) : 0;
+  };
+
+  if (len == 0)
+    return true;
+  uint8_t nal_header;
+  if (!this->conn_.read_exact(&nal_header, 1))
+    return false;
+  len--;
+  const uint8_t type = nal_header & 0x1F;
+
+  if (type >= 1 && type <= 23) {
+    // Single NAL unit packet.
+    uint8_t *dst = au.reserve(sizeof(H264_START_CODE) + 1 + len);
+    if (dst == nullptr) {
+      if (!this->conn_.skip(len))
+        return false;
+    } else {
+      memcpy(dst, H264_START_CODE, sizeof(H264_START_CODE));
+      dst[4] = nal_header;
+      if (!this->conn_.read_exact(dst + 5, len))
+        return false;
+      const size_t nal_len = 1 + len - pad(dst + 5, len);
+      au.note_nal(dst + 4, nal_len);
+      au.commit(sizeof(H264_START_CODE) + nal_len);
+    }
+  } else if (type == 28) {
+    // FU-A: one NAL unit split over several packets.
+    if (len == 0)
+      return true;
+    uint8_t fu_header;
+    if (!this->conn_.read_exact(&fu_header, 1))
+      return false;
+    len--;
+    const bool start = fu_header & 0x80;
+    const bool end = fu_header & 0x40;
+    uint8_t *dst = nullptr;
+    if (start) {
+      dst = au.reserve(sizeof(H264_START_CODE) + 1 + len);
+      if (dst != nullptr) {
+        memcpy(dst, H264_START_CODE, sizeof(H264_START_CODE));
+        dst[4] = (nal_header & 0xE0) | (fu_header & 0x1F);  // rebuild the original NAL header
+        au.note_nal_type(fu_header & 0x1F);
+        au.commit(sizeof(H264_START_CODE) + 1);
+        dst += 5;
+        au.set_in_fragment(true);
+      }
+    } else if (au.in_fragment()) {
+      dst = au.reserve(len);
+    } else {
+      au.mark_corrupt();  // the first fragment was lost
+    }
+    if (dst == nullptr) {
+      if (!this->conn_.skip(len))
+        return false;
+    } else {
+      if (!this->conn_.read_exact(dst, len))
+        return false;
+      au.commit(len - pad(dst, len));
+    }
+    if (end)
+      au.set_in_fragment(false);
+  } else if (type == 24) {
+    // STAP-A: several small NAL units (typically SPS, PPS and SEI) in one packet.
+    uint8_t *scratch = au.stap_scratch(len);
+    if (scratch == nullptr) {
+      if (!this->conn_.skip(len))
+        return false;
+    } else {
+      if (!this->conn_.read_exact(scratch, len))
+        return false;
+      au.unpack_stap_a(scratch, len - pad(scratch, len));
+    }
+  } else {
+    // STAP-B, MTAP and FU-B only exist in interleaved packetization mode, which cameras do not use over TCP.
+    if (!this->h264_unsupported_nal_logged_) {
+      this->h264_unsupported_nal_logged_ = true;
+      ESP_LOGW(TAG, "Skipping unsupported H.264 RTP packet type %u", type);
+    }
+    au.mark_corrupt();
+    if (!this->conn_.skip(len))
+      return false;
+  }
+
+  if (marker)
+    this->h264_access_unit_complete_();
+  return true;
+}
+
+void RtspMjpeg::h264_access_unit_complete_() {
+  H264Assembler &au = this->h264_assembler_;
+  if (!au.started())
+    return;
+  if (au.corrupt()) {
+    this->corrupt_frames_++;
+    this->h264_need_idr_ = true;  // later P pictures would reference the broken one
+    au.clear();
+    return;
+  }
+  if (!au.has_slice()) {
+    // Parameter sets or SEI sent on their own; the assembler has remembered the SPS and PPS.
+    au.clear();
+    return;
+  }
+
+  // Logged from the first picture rather than the SDP: by then the camera's in-band SPS is known, and some
+  // cameras (Dahua) keep announcing their old profile in the SDP after it is changed.
+  this->log_h264_profile_();
+  this->received_frames_++;
+  this->session_frames_++;
+  if (!this->frames_wanted_) {
+    // Nothing is shown: don't spend CPU on decoding, and start again from an IDR picture later.
+    this->h264_need_idr_ = true;
+    au.clear();
+    return;
+  }
+  const bool idr = au.has_idr();
+  // A decoder slower than the camera lets the queue grow, and the picture falls ever further behind. Once it
+  // is more than H264_MAX_LAG_MS behind, skip ahead to the next IDR picture instead of waiting for the queue
+  // to overflow (which with a large max_frame_size can take many seconds).
+  if (!idr && !this->h264_need_idr_ && this->h264_decoded_valid_ &&
+      static_cast<int32_t>(au.timestamp() - this->h264_decoded_timestamp_.load()) >
+          static_cast<int32_t>(90 * H264_MAX_LAG_MS)) {
+    const uint32_t now = millis();
+    if (now - this->last_warning_ms_ > 10000) {
+      this->last_warning_ms_ = now;
+      ESP_LOGW(TAG, "H.264 decoder is over %u ms behind the camera; skipping to the next key frame. Lower the "
+                    "camera's resolution or frame rate",
+               (unsigned) H264_MAX_LAG_MS);
+    }
+    this->h264_need_idr_ = true;
+  }
+  if (this->h264_need_idr_ && !idr) {
+    this->dropped_frames_++;
+    au.clear();
+    return;
+  }
+
+  // The decoder cannot start without SPS/PPS; cameras that only announce them in the SDP need them added.
+  const std::string &params = au.parameter_sets();
+  const size_t extra = idr && !au.has_sps() ? params.size() : 0;
+  const size_t total = sizeof(H264QueueHeader) + extra + au.length();
+  RingbufHandle_t queue = this->h264_queue_;
+  void *item = nullptr;
+  if (total > this->h264_max_item_ || xRingbufferSendAcquire(queue, &item, total, 0) != pdTRUE) {
+    // The decoder is too far behind (or the unit is too big): skip ahead to the next IDR picture.
+    const uint32_t now = millis();
+    if (now - this->last_warning_ms_ > 10000) {
+      this->last_warning_ms_ = now;
+      ESP_LOGW(TAG, "H.264 decoder cannot keep up%s; skipping to the next key frame",
+               total > this->h264_max_item_ ? " (access unit larger than max_frame_size)" : "");
+    }
+    this->dropped_frames_++;
+    this->h264_need_idr_ = true;
+    au.clear();
+    return;
+  }
+  H264QueueHeader header{};
+  header.generation = this->h264_generation_;
+  header.timestamp = au.timestamp();
+  header.idr = idr ? 1 : 0;
+  uint8_t *dst = static_cast<uint8_t *>(item);
+  memcpy(dst, &header, sizeof(header));
+  if (extra > 0)
+    memcpy(dst + sizeof(header), params.data(), extra);
+  memcpy(dst + sizeof(header) + extra, au.data(), au.length());
+  xRingbufferSendComplete(queue, item);
+  this->h264_latest_timestamp_ = au.timestamp();
+  this->h264_need_idr_ = false;
+  au.clear();
+  xTaskNotifyGive(this->decode_task_handle_);
+}
+
+#endif  // USE_ESP_RTSP_STREAM_H264
 
 // ---------------------------------------------------------------------------------------------------------------
 // Decode task
@@ -686,40 +987,56 @@ void RtspMjpeg::decode_loop_() {
     if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0) {
       // No frame pending. A paused stream hands its frame buffers back, so several streams (e.g. small tiles
       // and a full-size page of the same cameras) only need PSRAM for the ones on screen.
-      if (!this->connection_wanted_)
+      if (!this->connection_wanted_) {
         this->release_frame_buffers_();
+#ifdef USE_ESP_RTSP_STREAM_H264
+        this->drain_h264_queue_();  // skips everything: the stream restarts from an IDR picture
+        this->close_h264_decoder_();
+#endif
+      }
       continue;
     }
-    std::unique_lock<std::mutex> lock(this->frame_mutex_, std::defer_lock);
-    if (this->single_buffer_) {
-      // The canvas copy reads the buffer this decode overwrites; a frame not copied yet is skipped.
-      lock.lock();
-      this->new_frame_ = false;
-    }
-    const uint32_t start = millis();
-    const bool ok = this->decode_frame_(this->jpeg_buffers_[this->ready_index_], this->ready_len_, this->ready_width_,
-                                        this->ready_height_);
-    this->last_decode_ms_ = millis() - start;
-    this->decoder_busy_ = false;
-    if (!ok) {
-      this->corrupt_frames_++;
-      continue;
-    }
-
-    if (!lock.owns_lock())
-      lock.lock();
-    if (!this->single_buffer_)
-      this->front_ ^= 1;
-    this->front_width_ = this->back_width_;
-    this->front_height_ = this->back_height_;
-    this->front_stride_ = this->back_stride_;
-    lock.unlock();
-    if (++this->decoded_frames_ == 1) {
-      ESP_LOGI(TAG, "First frame: %dx%d stream -> %dx%d output, decoded in %u ms", this->ready_width_,
-               this->ready_height_, this->back_width_, this->back_height_, (unsigned) this->last_decode_ms_.load());
-    }
-    this->new_frame_ = true;
+    if (this->decoder_busy_)
+      this->decode_ready_jpeg_();
+#ifdef USE_ESP_RTSP_STREAM_H264
+    this->drain_h264_queue_();
+#endif
   }
+}
+
+void RtspMjpeg::decode_ready_jpeg_() {
+  std::unique_lock<std::mutex> lock(this->frame_mutex_, std::defer_lock);
+  if (this->single_buffer_) {
+    // The canvas copy reads the buffer this decode overwrites; a frame not copied yet is skipped.
+    lock.lock();
+    this->new_frame_ = false;
+  }
+  const uint32_t start = millis();
+  const bool ok = this->decode_frame_(this->jpeg_buffers_[this->ready_index_], this->ready_len_, this->ready_width_,
+                                      this->ready_height_);
+  this->last_decode_ms_ = millis() - start;
+  this->decoder_busy_ = false;
+  if (!ok) {
+    this->corrupt_frames_++;
+    return;
+  }
+  this->publish_frame_(lock, this->ready_width_, this->ready_height_);
+}
+
+void RtspMjpeg::publish_frame_(std::unique_lock<std::mutex> &lock, int src_width, int src_height) {
+  if (!lock.owns_lock())
+    lock.lock();
+  if (!this->single_buffer_)
+    this->front_ ^= 1;
+  this->front_width_ = this->back_width_;
+  this->front_height_ = this->back_height_;
+  this->front_stride_ = this->back_stride_;
+  lock.unlock();
+  if (++this->decoded_frames_ == 1) {
+    ESP_LOGI(TAG, "First frame: %dx%d stream -> %dx%d output, decoded in %u ms", src_width, src_height,
+             this->back_width_, this->back_height_, (unsigned) this->last_decode_ms_.load());
+  }
+  this->new_frame_ = true;
 }
 
 RtspMjpeg::OutputPlan RtspMjpeg::plan_output_(int src_width, int src_height) const {
@@ -943,7 +1260,11 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
     this->back_stride_ = padded_w;
     return true;
   }
+  return this->scale_staging_with_ppa_(plan, back, padded_w, padded_h, src_width, src_height);
+}
 
+bool RtspMjpeg::scale_staging_with_ppa_(const OutputPlan &plan, int back, int pic_w, int pic_h, int block_w,
+                                        int block_h) {
   // PPA writes straight into the frame buffer when it hits the exact size, else into scaled_ for a final resize.
   const bool exact = plan.stage_width == plan.out_width && plan.stage_height == plan.out_height;
   uint8_t *&ppa_out = exact ? this->rgb_[back] : this->scaled_;
@@ -953,10 +1274,10 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
 
   ppa_srm_oper_config_t op = {};
   op.in.buffer = this->staging_;
-  op.in.pic_w = padded_w;
-  op.in.pic_h = padded_h;
-  op.in.block_w = src_width;
-  op.in.block_h = src_height;
+  op.in.pic_w = pic_w;
+  op.in.pic_h = pic_h;
+  op.in.block_w = block_w;
+  op.in.block_h = block_h;
   op.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
   op.out.buffer = ppa_out;
   op.out.buffer_size = ppa_out_capacity;
@@ -971,7 +1292,7 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
   op.scale_x = plan.scale;
   op.scale_y = plan.scale;
   op.mode = PPA_TRANS_MODE_BLOCKING;
-  err = ppa_do_scale_rotate_mirror(this->ppa_client_, &op);
+  const esp_err_t err = ppa_do_scale_rotate_mirror(this->ppa_client_, &op);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "PPA scale/rotate failed: %s", esp_err_to_name(err));
     return false;
@@ -1042,6 +1363,284 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
 }
 
 #endif
+
+// ---------------------------------------------------------------------------------------------------------------
+// H.264 decoding (decode task)
+
+#ifdef USE_ESP_RTSP_STREAM_H264
+
+static inline int clamp_u8(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+
+static inline uint16_t yuv_to_rgb565(int y, int rv, int guv, int bu) {
+  const int c = (y - 16) * 298 + 128;
+  const int r = clamp_u8((c + rv) >> 8);
+  const int g = clamp_u8((c + guv) >> 8);
+  const int b = clamp_u8((c + bu) >> 8);
+  return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+/// Converts an I420 picture to little-endian RGB565 (BT.601, video range), rotating it clockwise by `rotation`
+/// while writing. With `halve` every 2x2 block becomes one pixel, which also matches the chroma resolution.
+/// The output is (width/2 or width&~1) x (height/2 or height&~1) before rotation, tightly packed.
+static void i420_to_rgb565(const uint8_t *y_plane, const uint8_t *u_plane, const uint8_t *v_plane, int y_stride,
+                           int uv_stride, int width, int height, bool halve, int rotation, uint16_t *dst) {
+  const int w = halve ? width / 2 : width & ~1;
+  const int h = halve ? height / 2 : height & ~1;
+  const int out_w = rotation == 90 || rotation == 270 ? h : w;
+  // Output index of source pixel (x, y) is origin + x * step_x + y * step_y.
+  int origin, step_x, step_y;
+  switch (rotation) {
+    case 90:
+      origin = h - 1, step_x = out_w, step_y = -1;
+      break;
+    case 180:
+      origin = (h - 1) * out_w + w - 1, step_x = -1, step_y = -out_w;
+      break;
+    case 270:
+      origin = (w - 1) * out_w, step_x = -out_w, step_y = 1;
+      break;
+    default:
+      origin = 0, step_x = 1, step_y = out_w;
+      break;
+  }
+
+  if (halve) {
+    for (int y = 0; y < h; y++) {
+      const uint8_t *y0 = y_plane + 2 * y * y_stride;
+      const uint8_t *y1 = y0 + y_stride;
+      const uint8_t *u = u_plane + y * uv_stride;
+      const uint8_t *v = v_plane + y * uv_stride;
+      uint16_t *out = dst + origin + y * step_y;
+      for (int x = 0; x < w; x++) {
+        const int d = u[x] - 128, e = v[x] - 128;
+        const int luma = (y0[2 * x] + y0[2 * x + 1] + y1[2 * x] + y1[2 * x + 1] + 2) >> 2;
+        *out = yuv_to_rgb565(luma, 409 * e, -100 * d - 208 * e, 516 * d);
+        out += step_x;
+      }
+    }
+    return;
+  }
+  for (int y = 0; y < h; y += 2) {
+    const uint8_t *y0 = y_plane + y * y_stride;
+    const uint8_t *y1 = y0 + y_stride;
+    const uint8_t *u = u_plane + (y / 2) * uv_stride;
+    const uint8_t *v = v_plane + (y / 2) * uv_stride;
+    uint16_t *out0 = dst + origin + y * step_y;
+    uint16_t *out1 = out0 + step_y;
+    for (int x = 0; x < w; x += 2) {
+      const int d = u[x / 2] - 128, e = v[x / 2] - 128;
+      const int rv = 409 * e, guv = -100 * d - 208 * e, bu = 516 * d;
+      out0[0] = yuv_to_rgb565(y0[x], rv, guv, bu);
+      out0[step_x] = yuv_to_rgb565(y0[x + 1], rv, guv, bu);
+      out1[0] = yuv_to_rgb565(y1[x], rv, guv, bu);
+      out1[step_x] = yuv_to_rgb565(y1[x + 1], rv, guv, bu);
+      out0 += 2 * step_x;
+      out1 += 2 * step_x;
+    }
+  }
+}
+
+bool RtspMjpeg::open_h264_decoder_() {
+  this->close_h264_decoder_();
+  esp_h264_dec_cfg_sw_t cfg = {};
+  cfg.pic_type = ESP_H264_RAW_FMT_I420;  // the only format the software decoder produces
+  esp_h264_dec_handle_t decoder = nullptr;
+  esp_h264_dec_param_sw_handle_t param = nullptr;
+  esp_h264_err_t err = esp_h264_dec_sw_new(&cfg, &decoder);
+  if (err == ESP_H264_ERR_OK) {
+    err = esp_h264_dec_open(decoder);
+    if (err == ESP_H264_ERR_OK)
+      err = esp_h264_dec_sw_get_param_hd(decoder, &param);
+    if (err != ESP_H264_ERR_OK) {
+      esp_h264_dec_close(decoder);
+      esp_h264_dec_del(decoder);
+    }
+  }
+  if (err != ESP_H264_ERR_OK) {
+    if (!this->h264_open_error_logged_) {
+      this->h264_open_error_logged_ = true;
+      ESP_LOGE(TAG, "Cannot start the H.264 decoder (error %d); is there enough free PSRAM?", (int) err);
+    }
+    return false;
+  }
+  this->h264_decoder_ = decoder;
+  this->h264_param_ = param;
+  this->h264_synced_ = false;
+  return true;
+}
+
+void RtspMjpeg::close_h264_decoder_() {
+  if (this->h264_decoder_ != nullptr) {
+    esp_h264_dec_close(this->h264_decoder_);
+    esp_h264_dec_del(this->h264_decoder_);
+    this->h264_decoder_ = nullptr;
+    this->h264_param_ = nullptr;
+  }
+  this->h264_synced_ = false;
+}
+
+void RtspMjpeg::drain_h264_queue_() {
+  RingbufHandle_t queue = this->h264_queue_;
+  if (queue == nullptr)
+    return;
+  size_t size = 0;
+  void *item;
+  while ((item = xRingbufferReceive(queue, &size, 0)) != nullptr) {
+    if (this->connection_wanted_)
+      this->decode_h264_access_unit_(static_cast<const uint8_t *>(item), size);
+    vRingbufferReturnItem(queue, item);
+  }
+}
+
+void RtspMjpeg::decode_h264_access_unit_(const uint8_t *item, size_t size) {
+  H264QueueHeader header;
+  if (size < sizeof(header))
+    return;
+  memcpy(&header, item, sizeof(header));
+  if (header.generation != this->h264_generation_)
+    return;  // queued by an earlier session
+  // How far the decoder has got, for the network task's lag check.
+  this->h264_decoded_timestamp_ = header.timestamp;
+  this->h264_decoded_valid_ = true;
+  if (this->h264_decoder_ == nullptr || header.generation != this->h264_decoder_generation_) {
+    // New stream (maybe a different camera or resolution): start from a clean decoder.
+    if (!this->open_h264_decoder_())
+      return;
+    this->h264_decoder_generation_ = header.generation;
+  }
+  if (!this->h264_synced_ && !header.idr) {
+    this->dropped_frames_++;  // P pictures are useless until an IDR picture has been decoded
+    return;
+  }
+  if (!header.idr && static_cast<int32_t>(this->h264_latest_timestamp_.load() - header.timestamp) >
+                         static_cast<int32_t>(90 * H264_MAX_LAG_MS)) {
+    // Queued long ago: decoding the backlog would only show old pictures slowly. Drop it and pick up again
+    // at the next IDR picture, which the network task queues as soon as it arrives.
+    this->dropped_frames_++;
+    this->h264_synced_ = false;
+    return;
+  }
+  this->h264_synced_ = true;
+
+  // Every access unit must be decoded, but only pictures due under max_fps are converted and shown.
+  const bool wanted = this->frames_wanted_ && this->frame_due_(this->h264_next_present_ms_);
+  bool presented = false;
+  esp_h264_dec_in_frame_t in = {};
+  in.raw_data.buffer = const_cast<uint8_t *>(item + sizeof(header));
+  in.raw_data.len = size - sizeof(header);
+  const uint32_t start = millis();
+  while (in.raw_data.len > 0) {
+    esp_h264_dec_out_frame_t out = {};
+    const esp_h264_err_t err = esp_h264_dec_process(this->h264_decoder_, &in, &out);
+    if (err != ESP_H264_ERR_OK) {
+      ESP_LOGD(TAG, "H.264 decode failed: %d", (int) err);
+      this->corrupt_frames_++;
+      // Restart from a fresh decoder at the next IDR picture: later pictures reference this one, and
+      // esp_h264 before 1.5.0 could crash when it kept decoding after a corrupted slice.
+      this->close_h264_decoder_();
+      return;
+    }
+    if (in.consume == 0 || in.consume > in.raw_data.len)
+      break;
+    in.raw_data.buffer += in.consume;
+    in.raw_data.len -= in.consume;
+    if (out.out_size == 0 || out.outbuf == nullptr)
+      continue;  // SPS, PPS, SEI: no picture
+
+    esp_h264_resolution_t res = {};
+    if (esp_h264_dec_get_resolution(this->h264_param_, &res) != ESP_H264_ERR_OK || res.width < 16 ||
+        res.height < 16)
+      continue;
+    this->stream_width_ = res.width;
+    this->stream_height_ = res.height;
+    if (!wanted || presented) {
+      this->dropped_frames_++;
+      continue;
+    }
+    presented = true;
+
+    // out.outbuf is only valid until the next process call, so convert it now.
+    std::unique_lock<std::mutex> lock(this->frame_mutex_, std::defer_lock);
+    if (this->single_buffer_) {
+      lock.lock();
+      this->new_frame_ = false;
+    }
+    const bool ok = this->present_i420_(out.outbuf, out.out_size, res.width, res.height);
+    this->last_decode_ms_ = millis() - start;
+    if (!ok) {
+      this->corrupt_frames_++;
+      continue;
+    }
+    this->publish_frame_(lock, res.width, res.height);
+  }
+}
+
+bool RtspMjpeg::present_i420_(const uint8_t *buf, size_t size, int width, int height) {
+  // The planes are packed at the picture size, or at the macroblock-aligned size the decoder works in.
+  auto i420_size = [](int w, int h) -> size_t {
+    return static_cast<size_t>(w) * h + 2 * static_cast<size_t>((w + 1) / 2) * ((h + 1) / 2);
+  };
+  int y_stride = width, y_rows = height;
+  if (size != i420_size(width, height)) {
+    const int aligned_w = (width + 15) & ~15, aligned_h = (height + 15) & ~15;
+    if (size == i420_size(aligned_w, aligned_h)) {
+      y_stride = aligned_w;
+      y_rows = aligned_h;
+    } else if (size < i420_size(width, height)) {
+      return false;
+    } else if (!this->h264_layout_logged_) {
+      this->h264_layout_logged_ = true;
+      ESP_LOGW(TAG, "Unexpected H.264 picture size %u bytes for %dx%d; colours may be wrong", (unsigned) size, width,
+               height);
+    }
+  }
+  const int uv_stride = (y_stride + 1) / 2;
+  const uint8_t *y_plane = buf;
+  const uint8_t *u_plane = y_plane + static_cast<size_t>(y_stride) * y_rows;
+  const uint8_t *v_plane = u_plane + static_cast<size_t>(uv_stride) * ((y_rows + 1) / 2);
+
+  // Converting at half size is nearly free in I420 (one chroma sample per 2x2 block) and quarters the work
+  // left for the scaler, so do it whenever the output is at most half the stream size.
+  const OutputPlan full = this->plan_output_(width, height);
+  const bool halve = full.target_width * 2 <= width && full.target_height * 2 <= height;
+  const int conv_w = halve ? width / 2 : width & ~1;
+  const int conv_h = halve ? height / 2 : height & ~1;
+  const size_t conv_bytes = static_cast<size_t>(conv_w) * conv_h * 2;
+  const OutputPlan plan = this->plan_output_(conv_w, conv_h);
+  const int back = this->single_buffer_ ? this->front_ : this->front_ ^ 1;
+
+#ifdef USE_ESP_RTSP_STREAM_HW_JPEG
+  // Convert unrotated, then let the PPA scale and rotate, as for JPEG.
+  const bool direct = this->rotation_ == 0 && plan.target_width == conv_w && plan.target_height == conv_h;
+  uint8_t *&target = direct ? this->rgb_[back] : this->staging_;
+  size_t &target_capacity = direct ? this->rgb_capacity_[back] : this->staging_capacity_;
+  if (!this->ensure_buffer_(target, target_capacity, conv_bytes))
+    return false;
+  i420_to_rgb565(y_plane, u_plane, v_plane, y_stride, uv_stride, width, height, halve, 0,
+                 reinterpret_cast<uint16_t *>(target));
+  if (direct) {
+    this->back_width_ = conv_w;
+    this->back_height_ = conv_h;
+    this->back_stride_ = conv_w;
+    return true;
+  }
+  // The CPU wrote the picture through the cache; the PPA reads memory directly.
+  esp_cache_msync(target, conv_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+  return this->scale_staging_with_ppa_(plan, back, conv_w, conv_h, conv_w, conv_h);
+#else
+  // Convert and rotate in one pass, then finish_frame_() halves and resizes as for JPEG.
+  const bool exact = plan.stage_width == plan.out_width && plan.stage_height == plan.out_height;
+  uint8_t *&out = exact ? this->rgb_[back] : this->scaled_;
+  size_t &out_capacity = exact ? this->rgb_capacity_[back] : this->scaled_capacity_;
+  if (!this->ensure_buffer_(out, out_capacity, conv_bytes))
+    return false;
+  i420_to_rgb565(y_plane, u_plane, v_plane, y_stride, uv_stride, width, height, halve, this->rotation_,
+                 reinterpret_cast<uint16_t *>(out));
+  return this->finish_frame_(plan, back);
+#endif
+}
+
+#endif  // USE_ESP_RTSP_STREAM_H264
 
 // ---------------------------------------------------------------------------------------------------------------
 // Drawing

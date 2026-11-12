@@ -6,6 +6,7 @@
 #include <string>
 
 #include <freertos/FreeRTOS.h>
+#include <freertos/ringbuf.h>
 #include <freertos/task.h>
 
 #include "esphome/core/component.h"
@@ -22,6 +23,7 @@
 #include "esphome/components/speaker/speaker.h"
 #endif
 #include "audio_rtp.h"
+#include "h264_rtp.h"
 #include "rfc2435.h"
 #include "rtsp_client.h"
 
@@ -29,15 +31,20 @@
 #include "driver/jpeg_decode.h"
 #include "driver/ppa.h"
 #endif
+#ifdef USE_ESP_RTSP_STREAM_H264
+#include "esp_h264_dec_sw.h"
+#endif
 
 namespace esphome {
 namespace esp_rtsp_stream {
 
-/// Pulls an MJPEG stream from an RTSP camera (RTP/JPEG over interleaved TCP) and decodes it to RGB565.
+/// Pulls an MJPEG or H.264 stream from an RTSP camera (RTP over interleaved TCP) and decodes it to RGB565.
 ///
-/// Two FreeRTOS tasks do the work: a network task that runs the RTSP session and rebuilds JPEG frames,
-/// and a decode task. Frames arriving while the decoder is busy, or faster than max_fps, are dropped so
-/// the picture never lags behind the camera. Decoded frames are double-buffered for draw().
+/// Two FreeRTOS tasks do the work: a network task that runs the RTSP session and rebuilds JPEG frames or
+/// H.264 access units, and a decode task. MJPEG frames arriving while the decoder is busy, or faster than
+/// max_fps, are dropped so the picture never lags behind the camera. H.264 pictures depend on each other, so
+/// every access unit is queued and decoded; only the conversion to RGB565 is limited to max_fps, and if the
+/// queue overflows the stream skips ahead to the next IDR picture. Decoded frames are double-buffered for draw().
 class RtspMjpeg : public Component {
  public:
   /// Sets the camera URL; safe to call at runtime (e.g. from a Home Assistant text sensor) and reconnects to
@@ -99,6 +106,8 @@ class RtspMjpeg : public Component {
   uint32_t get_last_decode_ms() const { return this->last_decode_ms_; }
 
  protected:
+  enum class VideoCodec : uint8_t { MJPEG, H264 };
+
   struct OutputPlan {
     float scale;          // PPA scale factor (P4)
     int target_width;     // exact aspect-preserving size, before rotation
@@ -128,9 +137,36 @@ class RtspMjpeg : public Component {
   /// Starts or stops the speaker to match the session and mute state. Main loop only.
   void update_audio_();
   void frame_complete_(size_t jpeg_len);
+  /// True if a frame should be shown now, at most max_fps; advances `next_due_ms` when it is.
+  bool frame_due_(uint32_t &next_due_ms);
+#ifdef USE_ESP_RTSP_STREAM_H264
+  /// Reads one H.264 RTP payload (the `len` bytes after the RTP header) into the access unit being built.
+  bool handle_h264_payload_(size_t len, bool marker, uint32_t timestamp, bool padding, bool lost);
+  /// Queues the finished access unit for the decode task.
+  void h264_access_unit_complete_();
+  bool ensure_h264_queue_();
+  void log_h264_profile_();
+#endif
 
   OutputPlan plan_output_(int src_width, int src_height) const;
+  /// Decodes the JPEG frame handed over by the network task and shows it.
+  void decode_ready_jpeg_();
+  /// Makes the frame just written to the back buffer the shown one. `lock` may already hold frame_mutex_.
+  void publish_frame_(std::unique_lock<std::mutex> &lock, int src_width, int src_height);
   bool decode_frame_(const uint8_t *jpeg, size_t len, int src_width, int src_height);
+#ifdef USE_ESP_RTSP_STREAM_HW_JPEG
+  /// PPA scale/rotate of the RGB565 picture in staging_ (pic_w x pic_h, of which block_w x block_h is used).
+  bool scale_staging_with_ppa_(const OutputPlan &plan, int back, int pic_w, int pic_h, int block_w, int block_h);
+#endif
+#ifdef USE_ESP_RTSP_STREAM_H264
+  /// Decodes every queued H.264 access unit.
+  void drain_h264_queue_();
+  void decode_h264_access_unit_(const uint8_t *item, size_t size);
+  /// Converts a decoded I420 picture into the back frame buffer, scaled and rotated.
+  bool present_i420_(const uint8_t *buf, size_t size, int width, int height);
+  bool open_h264_decoder_();
+  void close_h264_decoder_();
+#endif
   bool ensure_buffer_(uint8_t *&buf, size_t &capacity, size_t bytes);
   /// Resizes scaled_ into rgb_[back] if the scaler missed the exact size, and records the frame size.
   bool finish_frame_(const OutputPlan &plan, int back);
@@ -179,6 +215,7 @@ class RtspMjpeg : public Component {
   TaskHandle_t decode_task_handle_{nullptr};
 
   // Network task state
+  VideoCodec codec_{VideoCodec::MJPEG};
   int video_payload_type_{26};
   uint8_t rtp_channel_{0};
   bool have_seq_{false};
@@ -186,6 +223,34 @@ class RtspMjpeg : public Component {
   uint8_t qtables_[256];
   uint32_t next_frame_due_ms_{0};
   uint32_t session_frames_{0};
+
+  // H.264. The network task builds access units in jpeg_buffers_[fill_index_] and queues them in a ring buffer
+  // (an H264QueueHeader, then the Annex-B data); the decode task decodes all of them in order.
+  H264Assembler h264_assembler_;
+  std::atomic<RingbufHandle_t> h264_queue_{nullptr};
+  // Bumped for every H.264 session; queued units of an older session are skipped and the decoder restarts.
+  std::atomic<uint32_t> h264_generation_{0};
+#ifdef USE_ESP_RTSP_STREAM_H264
+  uint8_t *h264_queue_storage_{nullptr};
+  StaticRingbuffer_t h264_queue_struct_;
+  size_t h264_max_item_{0};
+  bool h264_need_idr_{true};  // network task: skip access units until the next IDR picture
+  int h264_logged_profile_{0};  // profile_idc last reported in the log
+  // RTP timestamp of the last access unit the decode task decoded, to measure how far behind it is.
+  std::atomic<uint32_t> h264_decoded_timestamp_{0};
+  std::atomic<bool> h264_decoded_valid_{false};
+  // RTP timestamp of the newest access unit queued, so the decode task can drop a stale backlog.
+  std::atomic<uint32_t> h264_latest_timestamp_{0};
+  bool h264_unsupported_nal_logged_{false};
+  // Decode task
+  esp_h264_dec_handle_t h264_decoder_{nullptr};
+  esp_h264_dec_param_sw_handle_t h264_param_{nullptr};
+  uint32_t h264_decoder_generation_{0};
+  bool h264_synced_{false};  // an IDR picture was decoded since the decoder (re)started
+  uint32_t h264_next_present_ms_{0};
+  bool h264_layout_logged_{false};
+  bool h264_open_error_logged_{false};
+#endif
 
   // Audio. The network task decodes packets and hands them to the speaker; the main loop starts and stops it.
   RtpAudioDecoder audio_decoder_;

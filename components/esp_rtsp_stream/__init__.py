@@ -1,3 +1,5 @@
+import os
+
 import esphome.codegen as cg
 from esphome.components import display, esp32, speaker
 from esphome.components.esp32.const import VARIANT_ESP32P4, VARIANT_ESP32S3
@@ -10,6 +12,7 @@ from esphome.const import (
     CONF_URL,
     CONF_USERNAME,
 )
+from esphome.core import CORE
 import esphome.final_validate as fv
 
 try:
@@ -34,6 +37,13 @@ CONF_AUDIO = "audio"
 CONF_SPEAKER = "speaker"
 CONF_SAMPLE_RATE = "sample_rate"
 CONF_MUTED = "muted"
+CONF_H264 = "h264"
+
+# Software H.264 decoder (tinyh264 based, Baseline profile only). Neither chip has an H.264 decoder in
+# hardware; the P4 only has an encoder. Published speeds at 640x480: ~9 fps on ESP32-S3, ~25 fps on ESP32-P4.
+# A range, not a pin: espressif/esp_video (used by P4 camera/intercom packages) requires esp_h264 1.3.*, so the
+# solver must be free to pick 1.3.x there. The decoder API is identical from 1.3.0 to 1.5.x.
+H264_IDF_COMPONENT = ("espressif/esp_h264", "^1.3.8")
 
 AUDIO_SCHEMA = cv.Schema(
     {
@@ -126,6 +136,8 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_LOG_FRAME_INFO, default=True): cv.boolean,
             cv.Optional(CONF_AUDIO): AUDIO_SCHEMA,
+            # Also accept H.264 (Baseline profile) streams. Off by default: it adds the esp_h264 decoder.
+            cv.Optional(CONF_H264, default=False): cv.boolean,
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
@@ -151,6 +163,46 @@ def _sdkconfig_default(name, value):
         setter(name, value)
     else:
         esp32.add_idf_sdkconfig_option(name, value)
+
+
+# Public include dirs of the registry components we use, relative to the component's root.
+IDF_COMPONENT_INCLUDE_DIRS = {
+    "espressif/esp_h264": ["interface/include", "sw/include", "port/include", "hw/include"],
+    "espressif/esp_new_jpeg": ["include"],
+}
+
+
+def _use_idf_component(name, ref):
+    """Adds a registry IDF component and puts its headers on the include path of ESPHome's code.
+
+    Native ESP-IDF builds (ESPHome 2026.10+) only download components added with add_idf_component: the
+    generated `src` component REQUIRES built-in IDF components only, so a managed component's public include
+    dirs never reach our sources. ESP-IDF still builds and links the component, so only the headers are
+    missing.
+    """
+    esp32.add_idf_component(name=name, ref=ref)
+    done = CORE.data.setdefault("esp_rtsp_stream_linked", set())
+    if name in done:
+        return  # MULTI_CONF: once per component, not per stream
+    done.add(name)
+    idf_name = name.replace("/", "__")  # espressif/esp_h264 -> espressif__esp_h264
+
+    add_src_cmake = getattr(esp32, "add_src_cmake", None)
+    if add_src_cmake is not None:
+        # Newer ESPHome: link the component into src, which also brings its public include dirs.
+        var = "esp_rtsp_stream_" + idf_name.replace("-", "_")
+        add_src_cmake(
+            f"idf_component_get_property({var} {idf_name} COMPONENT_LIB)\n"
+            f"target_link_libraries(${{COMPONENT_LIB}} PRIVATE ${{{var}}})\n"
+        )
+        return
+
+    # ESPHome 2026.10.x has no hook into src's CMake, and only passes -D/-W build flags to the compiler.
+    # -Wp,-I<dir> is GCC's way of handing -I<dir> to the preprocessor, so it gets through. The component
+    # manager downloads into <build>/managed_components/<owner>__<name> before anything is compiled.
+    root = str(CORE.relative_build_path("managed_components", idf_name))
+    for sub in IDF_COMPONENT_INCLUDE_DIRS.get(name, ["include"]):
+        cg.add_build_flag(f"-Wp,-I{os.path.join(root, sub)}")
 
 
 async def to_code(config):
@@ -191,9 +243,14 @@ async def to_code(config):
 
     if profile["idf_component"] is not None:
         name, ref = profile["idf_component"]
-        esp32.add_idf_component(name=name, ref=ref)
+        _use_idf_component(name, ref)
     if profile["define"] is not None:
         cg.add_define(profile["define"])
+    if config[CONF_H264]:
+        # The define is global, so one stream with h264: true builds the decoder for all of them.
+        name, ref = H264_IDF_COMPONENT
+        _use_idf_component(name, ref)
+        cg.add_define("USE_ESP_RTSP_STREAM_H264")
 
     # A larger TCP window keeps the camera sending while a frame is being decoded.
     _sdkconfig_default("CONFIG_LWIP_TCP_WND_DEFAULT", profile["tcp_window"])

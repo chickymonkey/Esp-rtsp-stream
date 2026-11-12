@@ -29,6 +29,7 @@ struct RtspResponse {
 struct SdpVideoTrack {
   int payload_type{-1};
   std::string encoding;         // from a=rtpmap, e.g. "JPEG" or "H264"
+  std::string fmtp;             // a=fmtp parameters for the payload type, e.g. sprop-parameter-sets
   std::string control;          // media-level a=control
   std::string session_control;  // session-level a=control
 };

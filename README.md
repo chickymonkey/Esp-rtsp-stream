@@ -1,8 +1,8 @@
 # esp_rtsp_stream
 
-ESPHome external component that shows an RTSP **MJPEG** camera stream (Hikvision, Dahua and other ONVIF-style IP cameras) on an ESP32-S3 or ESP32-P4 display. It can also play the camera's **audio** track on an ESPHome speaker.
+ESPHome external component that shows an RTSP **MJPEG** or **H.264** camera stream (Hikvision, Dahua and other ONVIF-style IP cameras) on an ESP32-S3 or ESP32-P4 display. It can also play the camera's **audio** track on an ESPHome speaker.
 
-It does not decode H.264/H.265. Set the camera stream you use, normally the sub-stream, to **MJPEG**.
+MJPEG works out of the box. H.264 is optional (`h264: true`), decoded in software, and limited to the **Baseline** profile; see [H.264](#h264). H.265 is not supported.
 
 ## How it works
 
@@ -10,7 +10,8 @@ It does not decode H.264/H.265. Set the camera stream you use, normally the sub-
 2. **RTP/JPEG (RFC 2435):** JPEG frames are rebuilt directly in a PSRAM buffer. Supported: types 0/1 (4:2:2 and 4:2:0), types 64/65 (restart markers), Q 1–99 (standard tables) and Q 128–255 (in-band tables).
 3. **Decoding:** a separate task decodes each frame to RGB565. A frame that arrives while the decoder is busy, or faster than `max_fps`, is dropped. The picture always shows the newest frame and never builds a backlog.
 4. **Display:** decoded frames are double-buffered. `id(cam).draw(it)` draws the newest frame from a display lambda.
-5. **Audio (optional):** if an `audio:` block is set, the camera's audio track is set up on the same TCP connection. G.711 or L16 audio is decoded, mixed to mono, resampled to the speaker's rate and sent to an ESPHome `speaker`. See [Audio](#audio).
+5. **H.264 (optional):** with `h264: true`, H.264 RTP (RFC 6184: single NAL, STAP-A, FU-A) is rebuilt into access units, queued, and decoded in order by Espressif's software decoder. See [H.264](#h264).
+6. **Audio (optional):** if an `audio:` block is set, the camera's audio track is set up on the same TCP connection. G.711 or L16 audio is decoded, mixed to mono, resampled to the speaker's rate and sent to an ESPHome `speaker`. See [Audio](#audio).
 
 ## Per-chip profiles
 
@@ -96,8 +97,9 @@ All options:
 | `output_width` / `output_height` | canvas size | Box the picture is fitted into, keeping its shape. Leave unset with `lvgl_canvas`. |
 | `rotation` | 0 | 0/90/180/270, clockwise |
 | `max_fps` | 12 (S3), 25 (P4) | Frames shown per second at most |
-| `max_frame_size` | 256 KB (S3), 1 MB (P4) | Largest JPEG frame accepted |
+| `max_frame_size` | 256 KB (S3), 1 MB (P4) | Largest JPEG frame (or H.264 access unit) accepted |
 | `log_frame_info` | true | Stats line every 30 s |
+| `h264` | false | Also accept H.264 Baseline streams; see [H.264](#h264) |
 | `audio` | — | Play the camera audio on a speaker; see [Audio](#audio) |
 
 ### Switching cameras
@@ -188,9 +190,46 @@ psram:
 
 For a portrait 800×1280 panel showing a landscape camera, use `rotation: 90`.
 
-## Cameras without MJPEG (go2rtc / Frigate)
+## H.264
 
-The ESP32 can't decode H.264. go2rtc can convert a stream to MJPEG for it:
+```yaml
+esp_rtsp_stream:
+  - id: front_door
+    h264: true            # adds espressif/esp_h264 (software decoder)
+    lvgl_canvas: cam_canvas
+```
+
+With `h264: true` the component accepts both MJPEG and H.264 and picks whichever the camera's SDP announces.
+
+**What is supported**
+
+- **Baseline profile only.** Espressif's decoder (tinyh264-based, `espressif/esp_h264` 1.3.8 or newer; 1.3.x is picked when `esp_video` is also in the build) handles Constrained Baseline. Main and High profile streams (CABAC, B-frames) fail to decode, and the log warns about the profile at connect time. Set the sub-stream's H.264 profile to Baseline:
+  - **Hikvision:** Video/Audio → Sub Stream → *Profile* **Basic Profile**, and *SVC* off.
+  - **Dahua:** Video → Sub Stream → Encode Mode **H.264B**.
+- **No hardware decoder.** The ESP32-P4 has a hardware H.264 *encoder* but no decoder, so both chips decode in software.
+- **Packetization:** single NAL units, STAP-A and FU-A (packetization-mode 0/1). SPS/PPS are taken from the SDP (`sprop-parameter-sets`) or in-band, and put in front of IDR pictures that lack them.
+
+**Performance** (Espressif's published decoder figures, decode only):
+
+| Resolution | ESP32-S3 | ESP32-P4 |
+|---|---|---|
+| 320×192 | ~23 fps | — |
+| 640×480 | ~9 fps | ~25 fps |
+| 1280×720 | ~3 fps (measured: 334 ms per frame) | ~7 fps |
+
+On the ESP32-S3, use 640×480 or smaller for H.264. At 1280×720 it only shows about 2 fps, with key frames only.
+
+**How it differs from MJPEG**
+
+- **Every picture is decoded.** H.264 P-frames depend on the previous picture, so they can't be dropped like JPEG frames. `max_fps` only limits how often a decoded picture is converted to RGB565 and shown. Set the camera's sub-stream **frame rate** to what the chip can decode. If the decoder falls more than 1 s behind the camera, the stream skips ahead to the next key frame (log: `decoder is over 1000 ms behind`). That keeps the delay under about a second, but shows as a stutter.
+- **Profile warning:** the profile is read from the camera's SPS, not the SDP. Some Dahua cameras keep announcing Main profile in the SDP after the stream is switched to H.264B.
+- **Short I-frame interval.** After a lost packet, a page change or a reconnect, the picture resumes at the next IDR (key) frame. Set the camera's I-frame interval to 1–2 × the frame rate (e.g. 10–20 at 10 fps) so that takes at most a second or two.
+- **Memory:** the access-unit queue uses 2 × `max_frame_size` of PSRAM, plus the decoder's reference pictures (about 1–2 MB at 640×480).
+- **Recommended:** ESP32-P4 with a 640×480 Baseline sub-stream at 10–15 fps. On the ESP32-S3 use 320×240-class streams, or MJPEG.
+
+## Cameras without MJPEG or Baseline H.264 (go2rtc / Frigate)
+
+If the camera only offers Main/High profile H.264 or H.265, go2rtc can convert the stream to MJPEG for it:
 
 ```yaml
 go2rtc:
@@ -496,7 +535,7 @@ With `log_frame_info: true`, the component logs each step of a session and a sta
 |---|---|
 | `Canvas shown` / `Canvas hidden` | The stream resumed or paused because the LVGL page changed. See `hidden_timeout`. |
 | `Audio track` | The camera's audio codec and rate, and the rate it is converted to. Missing if there is no `audio:` block or the camera has no audio. |
-| `Streaming MJPEG` | PLAY succeeded. `with audio` means the audio track was set up too. |
+| `Streaming MJPEG` / `Streaming H.264` | PLAY succeeded. `with audio` means the audio track was set up too. |
 | `First frame` | Camera size, output size and the time to decode the first frame. |
 | `fps shown` | Frames drawn per second since the previous stats line. |
 | `decode` | Time to decode and scale the latest frame. |
@@ -518,7 +557,7 @@ Things that look wrong but aren't:
 
 ## Limitations
 
-- MJPEG only; no H.264/H.265.
+- H.264 needs `h264: true` and the Baseline profile; no Main/High profile, no H.265. H.264 is decoded in software on both chips.
 - Audio must be G.711 (PCMA/PCMU) or L16. AAC, Opus and G.726 are not decoded; ( let go2rtc convert them if you have frigate installed).
 - Audio and picture are not lip-synced. Each plays as soon as it arrives, which is close enough for a door camera in LAN.
 - On boards where the microphone and speaker share one I2S bus, such as the ESP32-S3-BOX-3, the wake word is off while camera audio plays. See [Voice assistant and micro wake word](#voice-assistant-and-micro-wake-word-shared-i2s-bus).
