@@ -171,6 +171,21 @@ IDF_COMPONENT_INCLUDE_DIRS = {
     "espressif/esp_new_jpeg": ["include"],
 }
 
+# Functions we call from a registry component. src cannot declare the dependency on 2026.10.x, so the link
+# order of its archive is arbitrary: when another component (esp_video on the P4) also requires it, it lands
+# before libsrc.a and the linker never goes back for these. -Wl,-u makes them required from the start.
+IDF_COMPONENT_LINK_SYMBOLS = {
+    "espressif/esp_h264": [
+        "esp_h264_dec_sw_new",
+        "esp_h264_dec_sw_get_param_hd",
+        "esp_h264_dec_open",
+        "esp_h264_dec_process",
+        "esp_h264_dec_get_resolution",
+        "esp_h264_dec_close",
+        "esp_h264_dec_del",
+    ],
+}
+
 
 def _use_idf_component(name, ref):
     """Adds a registry IDF component and puts its headers on the include path of ESPHome's code.
@@ -203,6 +218,9 @@ def _use_idf_component(name, ref):
     root = str(CORE.relative_build_path("managed_components", idf_name))
     for sub in IDF_COMPONENT_INCLUDE_DIRS.get(name, ["include"]):
         cg.add_build_flag(f"-Wp,-I{os.path.join(root, sub)}")
+    # -Wl, flags go to src's link options, so the symbols are resolved wherever the archive sits.
+    for symbol in IDF_COMPONENT_LINK_SYMBOLS.get(name, []):
+        cg.add_build_flag(f"-Wl,-u,{symbol}")
 
 
 async def to_code(config):
