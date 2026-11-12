@@ -215,11 +215,14 @@ With `h264: true` the component accepts both MJPEG and H.264 and picks whichever
 |---|---|---|
 | 320×192 | ~23 fps | — |
 | 640×480 | ~9 fps | ~25 fps |
-| 1280×720 | — | ~7 fps |
+| 1280×720 | ~3 fps (measured: 334 ms per frame) | ~7 fps |
+
+On the ESP32-S3, use 640×480 or smaller for H.264. At 1280×720 it only shows about 2 fps, with key frames only.
 
 **How it differs from MJPEG**
 
-- **Every picture is decoded.** H.264 P-frames depend on the previous picture, so they can't be dropped like JPEG frames. `max_fps` only limits how often a decoded picture is converted to RGB565 and shown. Set the camera's sub-stream **frame rate** to what the chip can decode: if the decoder falls behind, its queue fills and the stream skips ahead to the next key frame, which shows as a stutter.
+- **Every picture is decoded.** H.264 P-frames depend on the previous picture, so they can't be dropped like JPEG frames. `max_fps` only limits how often a decoded picture is converted to RGB565 and shown. Set the camera's sub-stream **frame rate** to what the chip can decode. If the decoder falls more than 1 s behind the camera, the stream skips ahead to the next key frame (log: `decoder is over 1000 ms behind`). That keeps the delay under about a second, but shows as a stutter.
+- **Profile warning:** the profile is read from the camera's SPS, not the SDP. Some Dahua cameras keep announcing Main profile in the SDP after the stream is switched to H.264B.
 - **Short I-frame interval.** After a lost packet, a page change or a reconnect, the picture resumes at the next IDR (key) frame. Set the camera's I-frame interval to 1–2 × the frame rate (e.g. 10–20 at 10 fps) so that takes at most a second or two.
 - **Memory:** the access-unit queue uses 2 × `max_frame_size` of PSRAM, plus the decoder's reference pictures (about 1–2 MB at 640×480).
 - **Recommended:** ESP32-P4 with a 640×480 Baseline sub-stream at 10–15 fps. On the ESP32-S3 use 320×240-class streams, or MJPEG.

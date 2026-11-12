@@ -235,7 +235,12 @@ class RtspMjpeg : public Component {
   StaticRingbuffer_t h264_queue_struct_;
   size_t h264_max_item_{0};
   bool h264_need_idr_{true};  // network task: skip access units until the next IDR picture
-  bool h264_profile_logged_{false};
+  int h264_logged_profile_{0};  // profile_idc last reported in the log
+  // RTP timestamp of the last access unit the decode task decoded, to measure how far behind it is.
+  std::atomic<uint32_t> h264_decoded_timestamp_{0};
+  std::atomic<bool> h264_decoded_valid_{false};
+  // RTP timestamp of the newest access unit queued, so the decode task can drop a stale backlog.
+  std::atomic<uint32_t> h264_latest_timestamp_{0};
   bool h264_unsupported_nal_logged_{false};
   // Decode task
   esp_h264_dec_handle_t h264_decoder_{nullptr};

@@ -45,9 +45,12 @@ static const uint32_t DECODE_TASK_STACK = 8192;
 /// Precedes every H.264 access unit in the queue.
 struct H264QueueHeader {
   uint32_t generation;
+  uint32_t timestamp;  // RTP timestamp (90 kHz)
   uint8_t idr;
   uint8_t reserved[3];
 };
+// Skip ahead to the next IDR picture once the decoder is this far behind the camera.
+static const uint32_t H264_MAX_LAG_MS = 1000;
 static const uint8_t H264_START_CODE[4] = {0, 0, 0, 1};
 #endif
 
@@ -480,9 +483,9 @@ bool RtspMjpeg::run_session_() {
     this->h264_assembler_.set_sdp_fmtp(track.fmtp);
     this->h264_generation_++;  // the decode task restarts its decoder for the new stream
     this->h264_need_idr_ = true;
-    this->h264_profile_logged_ = false;
+    this->h264_decoded_valid_ = false;  // no picture of this stream decoded yet
+    this->h264_logged_profile_ = 0;
     this->h264_unsupported_nal_logged_ = false;
-    this->log_h264_profile_();
   }
 #endif
 
@@ -755,10 +758,11 @@ bool RtspMjpeg::ensure_h264_queue_() {
 }
 
 void RtspMjpeg::log_h264_profile_() {
+  // Logged again if the camera's SPS changes profile mid-session.
   const int profile = this->h264_assembler_.profile_idc();
-  if (this->h264_profile_logged_ || profile == 0)
+  if (profile == this->h264_logged_profile_ || profile == 0)
     return;
-  this->h264_profile_logged_ = true;
+  this->h264_logged_profile_ = profile;
   if (profile == 66) {
     ESP_LOGI(TAG, "H.264 Baseline profile");
   } else {
@@ -877,7 +881,6 @@ void RtspMjpeg::h264_access_unit_complete_() {
   H264Assembler &au = this->h264_assembler_;
   if (!au.started())
     return;
-  this->log_h264_profile_();  // the profile may only be known from an in-band SPS
   if (au.corrupt()) {
     this->corrupt_frames_++;
     this->h264_need_idr_ = true;  // later P pictures would reference the broken one
@@ -890,6 +893,9 @@ void RtspMjpeg::h264_access_unit_complete_() {
     return;
   }
 
+  // Logged from the first picture rather than the SDP: by then the camera's in-band SPS is known, and some
+  // cameras (Dahua) keep announcing their old profile in the SDP after it is changed.
+  this->log_h264_profile_();
   this->received_frames_++;
   this->session_frames_++;
   if (!this->frames_wanted_) {
@@ -899,6 +905,21 @@ void RtspMjpeg::h264_access_unit_complete_() {
     return;
   }
   const bool idr = au.has_idr();
+  // A decoder slower than the camera lets the queue grow, and the picture falls ever further behind. Once it
+  // is more than H264_MAX_LAG_MS behind, skip ahead to the next IDR picture instead of waiting for the queue
+  // to overflow (which with a large max_frame_size can take many seconds).
+  if (!idr && !this->h264_need_idr_ && this->h264_decoded_valid_ &&
+      static_cast<int32_t>(au.timestamp() - this->h264_decoded_timestamp_.load()) >
+          static_cast<int32_t>(90 * H264_MAX_LAG_MS)) {
+    const uint32_t now = millis();
+    if (now - this->last_warning_ms_ > 10000) {
+      this->last_warning_ms_ = now;
+      ESP_LOGW(TAG, "H.264 decoder is over %u ms behind the camera; skipping to the next key frame. Lower the "
+                    "camera's resolution or frame rate",
+               (unsigned) H264_MAX_LAG_MS);
+    }
+    this->h264_need_idr_ = true;
+  }
   if (this->h264_need_idr_ && !idr) {
     this->dropped_frames_++;
     au.clear();
@@ -926,6 +947,7 @@ void RtspMjpeg::h264_access_unit_complete_() {
   }
   H264QueueHeader header{};
   header.generation = this->h264_generation_;
+  header.timestamp = au.timestamp();
   header.idr = idr ? 1 : 0;
   uint8_t *dst = static_cast<uint8_t *>(item);
   memcpy(dst, &header, sizeof(header));
@@ -933,6 +955,7 @@ void RtspMjpeg::h264_access_unit_complete_() {
     memcpy(dst + sizeof(header), params.data(), extra);
   memcpy(dst + sizeof(header) + extra, au.data(), au.length());
   xRingbufferSendComplete(queue, item);
+  this->h264_latest_timestamp_ = au.timestamp();
   this->h264_need_idr_ = false;
   au.clear();
   xTaskNotifyGive(this->decode_task_handle_);
@@ -1476,6 +1499,9 @@ void RtspMjpeg::decode_h264_access_unit_(const uint8_t *item, size_t size) {
   memcpy(&header, item, sizeof(header));
   if (header.generation != this->h264_generation_)
     return;  // queued by an earlier session
+  // How far the decoder has got, for the network task's lag check.
+  this->h264_decoded_timestamp_ = header.timestamp;
+  this->h264_decoded_valid_ = true;
   if (this->h264_decoder_ == nullptr || header.generation != this->h264_decoder_generation_) {
     // New stream (maybe a different camera or resolution): start from a clean decoder.
     if (!this->open_h264_decoder_())
@@ -1484,6 +1510,14 @@ void RtspMjpeg::decode_h264_access_unit_(const uint8_t *item, size_t size) {
   }
   if (!this->h264_synced_ && !header.idr) {
     this->dropped_frames_++;  // P pictures are useless until an IDR picture has been decoded
+    return;
+  }
+  if (!header.idr && static_cast<int32_t>(this->h264_latest_timestamp_.load() - header.timestamp) >
+                         static_cast<int32_t>(90 * H264_MAX_LAG_MS)) {
+    // Queued long ago: decoding the backlog would only show old pictures slowly. Drop it and pick up again
+    // at the next IDR picture, which the network task queues as soon as it arrives.
+    this->dropped_frames_++;
+    this->h264_synced_ = false;
     return;
   }
   this->h264_synced_ = true;
