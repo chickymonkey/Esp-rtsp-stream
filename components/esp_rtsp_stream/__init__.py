@@ -1,4 +1,5 @@
 import os
+import shutil
 
 import esphome.codegen as cg
 from esphome.components import display, esp32, speaker
@@ -13,6 +14,7 @@ from esphome.const import (
     CONF_USERNAME,
 )
 from esphome.core import CORE
+from esphome.coroutine import coroutine_with_priority
 import esphome.final_validate as fv
 
 try:
@@ -171,6 +173,21 @@ IDF_COMPONENT_INCLUDE_DIRS = {
     "espressif/esp_new_jpeg": ["include"],
 }
 
+# Functions we call from a registry component. src cannot declare the dependency on 2026.10.x, so the link
+# order of its archive is arbitrary: when another component (esp_video on the P4) also requires it, it lands
+# before libsrc.a and the linker never goes back for these. -Wl,-u makes them required from the start.
+IDF_COMPONENT_LINK_SYMBOLS = {
+    "espressif/esp_h264": [
+        "esp_h264_dec_sw_new",
+        "esp_h264_dec_sw_get_param_hd",
+        "esp_h264_dec_open",
+        "esp_h264_dec_process",
+        "esp_h264_dec_get_resolution",
+        "esp_h264_dec_close",
+        "esp_h264_dec_del",
+    ],
+}
+
 
 def _use_idf_component(name, ref):
     """Adds a registry IDF component and puts its headers on the include path of ESPHome's code.
@@ -203,6 +220,30 @@ def _use_idf_component(name, ref):
     root = str(CORE.relative_build_path("managed_components", idf_name))
     for sub in IDF_COMPONENT_INCLUDE_DIRS.get(name, ["include"]):
         cg.add_build_flag(f"-Wp,-I{os.path.join(root, sub)}")
+    # -Wl, flags go to src's link options, so the symbols are resolved wherever the archive sits.
+    for symbol in IDF_COMPONENT_LINK_SYMBOLS.get(name, []):
+        cg.add_build_flag(f"-Wl,-u,{symbol}")
+
+
+ESP_H264_STUB = "components/esp_h264/CMakeLists.txt"
+
+
+# Runs after every other component's to_code (-1000 is CoroPriority.FINAL).
+@coroutine_with_priority(-1000.0)
+async def _drop_empty_esp_h264_stub():
+    """Removes an empty local `esp_h264` component that would hide the real decoder.
+
+    esp_video_camera (JPEG profile) adds an empty IDF component named esp_h264 so that esp_video's manifest
+    dependency is satisfied without building H.264. IDF prefers a local component over the managed
+    espressif__esp_h264 of the same name, so the real library is never built and our decoder calls fail to
+    link. esp_video's own H.264 code stays Kconfig-gated, so it is unaffected by building the real one.
+    """
+    extra = CORE.data.get("esp32", {}).get("extra_build_files")
+    if extra is not None and extra.pop(ESP_H264_STUB, None) is not None:
+        # ESPHome never deletes a build file it stopped copying, so remove the copy from earlier builds.
+        stale = CORE.relative_build_path("components", "esp_h264")
+        if os.path.isdir(stale):
+            shutil.rmtree(stale, ignore_errors=True)
 
 
 async def to_code(config):
@@ -251,6 +292,9 @@ async def to_code(config):
         name, ref = H264_IDF_COMPONENT
         _use_idf_component(name, ref)
         cg.add_define("USE_ESP_RTSP_STREAM_H264")
+        if not CORE.data.get("esp_rtsp_stream_h264_stub_job"):
+            CORE.data["esp_rtsp_stream_h264_stub_job"] = True
+            CORE.add_job(_drop_empty_esp_h264_stub)
 
     # A larger TCP window keeps the camera sending while a frame is being decoded.
     _sdkconfig_default("CONFIG_LWIP_TCP_WND_DEFAULT", profile["tcp_window"])
