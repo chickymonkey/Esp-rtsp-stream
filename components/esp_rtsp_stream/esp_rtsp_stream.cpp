@@ -98,14 +98,8 @@ void RtspMjpeg::setup() {
     this->single_buffer_ = false;  // draw() reads the frame buffer directly
 #endif
 
-  for (auto &buf : this->jpeg_buffers_) {
-    buf = this->alloc_jpeg_buffer_(this->max_frame_size_);
-    if (buf == nullptr) {
-      ESP_LOGE(TAG, "Cannot allocate %u byte JPEG buffers; is PSRAM enabled?", (unsigned) this->max_frame_size_);
-      this->mark_failed();
-      return;
-    }
-  }
+  // The receive buffers are allocated when a session starts and freed while the stream is paused
+  // (acquire_stream_memory_ / release_stream_memory_), so a stream that is not on screen holds no PSRAM.
 
 #ifdef USE_ESP_RTSP_STREAM_AUDIO
   if (this->speaker_ != nullptr) {
@@ -310,13 +304,22 @@ void RtspMjpeg::network_loop_() {
       continue;
     }
     if (!this->connection_wanted_) {
-      // Canvas hidden: stay disconnected until loop() or set_url() wakes us.
+      // Canvas hidden: stay disconnected until loop() or set_url() wakes us. The decode task frees the stream's
+      // buffers meanwhile; acquire_stream_memory_() takes them back before the next session.
+      {
+        std::lock_guard<std::mutex> lock(this->stream_memory_mutex_);
+        this->network_idle_ = true;
+      }
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
       backoff_ms = 1000;
       continue;
     }
     if (!network::is_connected()) {
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+      continue;
+    }
+    if (!this->acquire_stream_memory_()) {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));  // retry later: something else may free PSRAM
       continue;
     }
     const bool got_frames = this->run_session_();
@@ -987,13 +990,8 @@ void RtspMjpeg::decode_loop_() {
     if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0) {
       // No frame pending. A paused stream hands its frame buffers back, so several streams (e.g. small tiles
       // and a full-size page of the same cameras) only need PSRAM for the ones on screen.
-      if (!this->connection_wanted_) {
-        this->release_frame_buffers_();
-#ifdef USE_ESP_RTSP_STREAM_H264
-        this->drain_h264_queue_();  // skips everything: the stream restarts from an IDR picture
-        this->close_h264_decoder_();
-#endif
-      }
+      if (!this->connection_wanted_)
+        this->release_stream_memory_();
       continue;
     }
     if (this->decoder_busy_)
@@ -1133,7 +1131,59 @@ uint8_t *RtspMjpeg::alloc_jpeg_buffer_(size_t bytes) {
 
 void RtspMjpeg::free_buffer_(uint8_t *buf) { heap_caps_free(buf); }
 
-void RtspMjpeg::release_frame_buffers_() {
+bool RtspMjpeg::acquire_stream_memory_() {
+  std::lock_guard<std::mutex> lock(this->stream_memory_mutex_);
+  this->network_idle_ = false;  // from here on the decode task leaves the receive buffers alone
+  for (auto &buf : this->jpeg_buffers_) {
+    if (buf == nullptr)
+      buf = this->alloc_jpeg_buffer_(this->max_frame_size_);
+    if (buf == nullptr) {
+      ESP_LOGE(TAG, "Cannot allocate %u byte receive buffers (%u KB PSRAM free); lower max_frame_size",
+               (unsigned) this->max_frame_size_, (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+      return false;
+    }
+  }
+  return true;
+}
+
+void RtspMjpeg::release_stream_memory_() {
+  std::lock_guard<std::mutex> lock(this->stream_memory_mutex_);
+  // Only once the network task has left the session: it writes the receive buffers and the H.264 queue.
+  if (this->connection_wanted_ || !this->network_idle_)
+    return;
+  const size_t before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  bool freed = this->release_frame_buffers_();
+#ifdef USE_ESP_RTSP_STREAM_H264
+  this->drain_h264_queue_();  // skips everything: the stream restarts from an IDR picture
+  if (this->h264_decoder_ != nullptr) {
+    this->close_h264_decoder_();
+    freed = true;
+  }
+  RingbufHandle_t queue = this->h264_queue_.exchange(nullptr);
+  if (queue != nullptr) {
+    vRingbufferDelete(queue);  // created static: the storage is ours to free
+    heap_caps_free(this->h264_queue_storage_);
+    this->h264_queue_storage_ = nullptr;
+    freed = true;
+  }
+#endif
+  this->decoder_busy_ = false;  // no frame is pending any more; its buffer goes below
+  for (auto &buf : this->jpeg_buffers_) {
+    if (buf != nullptr) {
+      this->free_buffer_(buf);
+      buf = nullptr;
+      freed = true;
+    }
+  }
+  if (!freed)
+    return;
+  const size_t after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  ESP_LOGI(TAG, "Stream paused: released %u KB of PSRAM, %u KB free (largest block %u KB)",
+           (unsigned) (after > before ? (after - before) / 1024 : 0), (unsigned) (after / 1024),
+           (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+}
+
+bool RtspMjpeg::release_frame_buffers_() {
   // Decode task only, so no decode is using them; frame_mutex_ keeps the canvas copy out.
   std::lock_guard<std::mutex> lock(this->frame_mutex_);
   bool freed = false;
@@ -1152,7 +1202,7 @@ void RtspMjpeg::release_frame_buffers_() {
   release(this->staging_, this->staging_capacity_);
 #endif
   if (!freed)
-    return;
+    return false;
   this->front_width_ = 0;
   this->front_height_ = 0;
   this->new_frame_ = false;
@@ -1160,7 +1210,7 @@ void RtspMjpeg::release_frame_buffers_() {
   this->canvas_frame_width_ = 0;  // clear the canvas borders again on the next frame
   this->canvas_frame_height_ = 0;
 #endif
-  ESP_LOGD(TAG, "Stream paused: frame buffers freed");
+  return true;
 }
 
 bool RtspMjpeg::ensure_buffer_(uint8_t *&buf, size_t &capacity, size_t bytes) {
