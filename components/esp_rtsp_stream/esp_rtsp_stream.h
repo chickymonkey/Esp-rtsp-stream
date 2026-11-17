@@ -175,8 +175,13 @@ class RtspMjpeg : public Component {
 #endif
   uint8_t *alloc_jpeg_buffer_(size_t bytes);
   void free_buffer_(uint8_t *buf);
-  /// Frees the decode/frame buffers while the stream is paused. Decode task only.
-  void release_frame_buffers_();
+  /// Frees the decode/frame buffers while the stream is paused. Decode task only. True if anything was freed.
+  bool release_frame_buffers_();
+  /// Network task, before a session: allocates the receive buffers a paused stream gave back.
+  bool acquire_stream_memory_();
+  /// Decode task, once the stream is paused and the network task idle: frees everything the stream holds
+  /// (frame buffers, H.264 decoder and queue, receive buffers) and logs how much PSRAM came back.
+  void release_stream_memory_();
 
   // Configuration
   // Written by set_url()/set_credentials() on the main loop, read by the network task.
@@ -207,6 +212,10 @@ class RtspMjpeg : public Component {
   std::atomic<bool> connection_wanted_{true};
   uint32_t hidden_timeout_ms_{3000};
   uint32_t last_visible_ms_{0};
+  // Guards the receive buffers and H.264 queue while they are freed (decode task) or allocated (network task).
+  std::mutex stream_memory_mutex_;
+  // Set by the network task while it is paused and touches no stream buffers; cleared before it uses them.
+  bool network_idle_{false};
 
   RtspUrl parsed_url_;
   RtspConnection conn_;

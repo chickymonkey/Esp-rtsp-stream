@@ -2,7 +2,7 @@
 
 ESPHome external component that shows an RTSP **MJPEG** or **H.264** camera stream (Hikvision, Dahua and other ONVIF-style IP cameras) on an ESP32-S3 or ESP32-P4 display. It can also play the camera's **audio** track on an ESPHome speaker.
 
-MJPEG works out of the box. H.264 is optional (`h264: true`), decoded in software, and limited to the **Baseline** profile; see [H.264](#h264). H.265 is not supported.
+MJPEG works out of the box. H.264 is optional (`h264: true`), decoded in software, and limited to the **Baseline** profile (on Dahua cameras: Encode Mode **H.264B**, not H.264 or H.264H); see [H.264](#h264). H.265 is not supported.
 
 ## How it works
 
@@ -10,7 +10,7 @@ MJPEG works out of the box. H.264 is optional (`h264: true`), decoded in softwar
 2. **RTP/JPEG (RFC 2435):** JPEG frames are rebuilt directly in a PSRAM buffer. Supported: types 0/1 (4:2:2 and 4:2:0), types 64/65 (restart markers), Q 1–99 (standard tables) and Q 128–255 (in-band tables).
 3. **Decoding:** a separate task decodes each frame to RGB565. A frame that arrives while the decoder is busy, or faster than `max_fps`, is dropped. The picture always shows the newest frame and never builds a backlog.
 4. **Display:** decoded frames are double-buffered. `id(cam).draw(it)` draws the newest frame from a display lambda.
-5. **H.264 (optional):** with `h264: true`, H.264 RTP (RFC 6184: single NAL, STAP-A, FU-A) is rebuilt into access units, queued, and decoded in order by Espressif's software decoder. See [H.264](#h264).
+5. **H.264 (h264b only) (optional):** with `h264: true`, H.264 RTP (RFC 6184: single NAL, STAP-A, FU-A) is rebuilt into access units, queued, and decoded in order by Espressif's software decoder. See [H.264](#h264).
 6. **Audio (optional):** if an `audio:` block is set, the camera's audio track is set up on the same TCP connection. G.711 or L16 audio is decoded, mixed to mono, resampled to the speaker's rate and sent to an ESPHome `speaker`. See [Audio](#audio).
 
 ## Per-chip profiles
@@ -139,7 +139,7 @@ How the picture fits the canvas:
 How it updates:
 - **Copying:** frames are copied into the canvas from the main loop, which is safe for LVGL.
 - **Hidden canvas:** while another page is showing, frames are not decoded.
-- **Disconnect when away:** once the canvas has been hidden for `hidden_timeout` (default 3 s), the ESP32 sends TEARDOWN and closes the RTSP session. That frees the camera's session slot, WiFi bandwidth and CPU. A quick page flick shorter than that keeps the session.
+- **Disconnect when away:** once the canvas has been hidden for `hidden_timeout` (default 3 s), the ESP32 sends TEARDOWN and closes the RTSP session. That frees the camera's session slot, WiFi bandwidth and CPU. About a second later the stream also gives back all of its PSRAM: receive buffers, frame buffers, and the H.264 decoder and queue. The log shows `Stream paused: released N KB of PSRAM`. They are allocated again when the stream reconnects. A quick page flick shorter than that keeps the session.
 - **Coming back:** the stream reconnects as soon as the canvas shows again. The last picture stays on screen until the first new frame, usually within a second or two.
 - **Always connected:** set `hidden_timeout: never` to keep the session open, so the picture returns instantly.
 
@@ -205,7 +205,7 @@ With `h264: true` the component accepts both MJPEG and H.264 and picks whichever
 
 - **Baseline profile only.** Espressif's decoder (tinyh264-based, `espressif/esp_h264` 1.3.8 or newer; 1.3.x is picked when `esp_video` is also in the build) handles Constrained Baseline. Main and High profile streams (CABAC, B-frames) fail to decode, and the log warns about the profile at connect time. Set the sub-stream's H.264 profile to Baseline:
   - **Hikvision:** Video/Audio → Sub Stream → *Profile* **Basic Profile**, and *SVC* off.
-  - **Dahua:** Video → Sub Stream → Encode Mode **H.264B**.
+  - **Dahua:** Video → Sub Stream → Encode Mode **H.264B**. Dahua names the profiles by encode mode: **H.264B** is Baseline (works), plain **H.264** is Main and **H.264H** is High (both fail with `profile_idc is error`). Also set *SVC* to 1 (off) and turn *Smart Codec* off.
 - **No hardware decoder.** The ESP32-P4 has a hardware H.264 *encoder* but no decoder, so both chips decode in software.
 - **Packetization:** single NAL units, STAP-A and FU-A (packetization-mode 0/1). SPS/PPS are taken from the SDP (`sprop-parameter-sets`) or in-band, and put in front of IDR pictures that lack them.
 
@@ -224,7 +224,7 @@ On the ESP32-S3, use 640×480 or smaller for H.264. At 1280×720 it only shows a
 - **Every picture is decoded.** H.264 P-frames depend on the previous picture, so they can't be dropped like JPEG frames. `max_fps` only limits how often a decoded picture is converted to RGB565 and shown. Set the camera's sub-stream **frame rate** to what the chip can decode. If the decoder falls more than 1 s behind the camera, the stream skips ahead to the next key frame (log: `decoder is over 1000 ms behind`). That keeps the delay under about a second, but shows as a stutter.
 - **Profile warning:** the profile is read from the camera's SPS, not the SDP. Some Dahua cameras keep announcing Main profile in the SDP after the stream is switched to H.264B.
 - **Short I-frame interval.** After a lost packet, a page change or a reconnect, the picture resumes at the next IDR (key) frame. Set the camera's I-frame interval to 1–2 × the frame rate (e.g. 10–20 at 10 fps) so that takes at most a second or two.
-- **Memory:** the access-unit queue uses 2 × `max_frame_size` of PSRAM, plus the decoder's reference pictures (about 1–2 MB at 640×480).
+- **Memory:** the access-unit queue uses 2 × `max_frame_size` of PSRAM, plus the decoder's reference pictures. The camera's H.264 level sets how many the decoder reserves when the stream starts: 2–8 MB at 640×480. If it can't get them, the log shows `H264_DEC.SW: Memory lack`. All of it is freed while the stream is paused.
 - **Recommended:** ESP32-P4 with a 640×480 Baseline sub-stream at 10–15 fps. On the ESP32-S3 use 320×240-class streams, or MJPEG.
 
 ## Cameras without MJPEG or Baseline H.264 (go2rtc / Frigate)
